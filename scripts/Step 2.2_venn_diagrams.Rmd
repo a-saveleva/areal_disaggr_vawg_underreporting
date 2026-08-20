@@ -1,0 +1,239 @@
+# ------------------------------------------------------------
+# Packages
+# ------------------------------------------------------------
+```{r}
+packages <- c("nVennR2", "here", "readr", "dplyr", "showtext", "sysfonts")
+new_packages <- packages[!packages %in% rownames(installed.packages())]
+if (length(new_packages)) install.packages(new_packages)
+
+library(nVennR2)
+library(here)
+library(readr)
+library(dplyr)
+library(showtext)
+library(sysfonts)
+
+# Register Roboto Slab
+font_add_google("Roboto Slab", "roboto_slab")
+showtext_auto()
+
+# Use Roboto Slab for base graphics
+par(family = "roboto_slab")
+
+# ------------------------------------------------------------
+# Import incident-level data
+# ------------------------------------------------------------
+
+df <- read_csv(
+  here("data/csew", "vawg_incident_level.csv"),
+  show_col_types = FALSE
+)
+
+vawg_cols <- c(
+  "vawg_official_codes",
+  "vawg_sex_force_threats",
+  "vawg_domestic",
+  "vawg_harasm"
+)
+
+set_names <- c(
+  "Official",
+  "Force/threats",
+  "Domestic",
+  "Harassment"
+)
+
+palette <- c(
+  "#0b6e4f",
+  "#f15bb5",
+  "#00bbf9",
+  "#ffd100"
+)
+
+# ------------------------------------------------------------
+# Prepare incident-level indicators
+# ------------------------------------------------------------
+
+vawg <- df |>
+  select(all_of(vawg_cols)) |>
+  mutate(across(
+    everything(),
+    ~ . %in% c(TRUE, "TRUE", "True", "true", 1, "1")
+  ))
+
+incident_id <- seq_len(nrow(vawg))
+
+sets <- setNames(
+  lapply(vawg_cols, \(x) incident_id[vawg[[x]]]),
+  set_names
+)
+
+totals <- sapply(sets, length)
+print(totals)
+
+# ------------------------------------------------------------
+# Fit free-form nVenn diagram
+# ------------------------------------------------------------
+```
+```{r}
+# ------------------------------------------------------------
+# Sexual-offence definition overlap
+# ------------------------------------------------------------
+
+sex_cols <- c(
+  "vawg_official_codes",
+  "whatfo4f",
+  "whatfo4g",
+  "whatfo4h",
+  "v712"
+)
+
+sex_names <- c(
+  "Official",
+  "Rape",
+  "Attempted rape",
+  "Sexual assault",
+  "Sexual element"
+)
+
+sex_palette <- c(
+  "#0b6e4f",
+  "#f15bb5",
+  "#00bbf9",
+  "#ffd100",
+  "#8e6bb8"
+)
+
+sex_vawg <- df |>
+  select(all_of(sex_cols)) |>
+  mutate(
+    vawg_official_codes = vawg_official_codes,
+    across(
+      c(whatfo4f, whatfo4g, whatfo4h, v712),
+      ~ grepl("1", as.character(.), fixed = TRUE)
+    ),
+    vawg_official_codes = vawg_official_codes %in%
+      c(TRUE, "TRUE", "True", "true", 1, "1")
+  )
+
+incident_id <- seq_len(nrow(sex_vawg))
+
+sex_sets <- setNames(
+  lapply(sex_cols, \(x) incident_id[sex_vawg[[x]]]),
+  sex_names
+)
+
+print(sapply(sex_sets, length))
+
+set.seed(123)
+
+sex_fit <- nVennDiagram(
+  sex_sets,
+  verbose = FALSE
+)
+
+sex_fit <- setVennSkin(
+  sex_fit,
+  params = list(
+    opacity = 0.55,
+    lineWidth = 2,
+    fontSize = 12,
+    fontFamily = "roboto_slab",
+    showRegions = FALSE,
+    showWeights = TRUE,
+    colors = sex_palette
+  ),
+  plot = FALSE
+)
+
+plotVenn(sex_fit)
+
+svg_file <- here("figures", "nvenn_official_sexual_offences.svg")
+
+plotVenn(
+  sex_fit,
+  outFile = svg_file
+)
+
+rsvg::rsvg_png(
+  svg_file,
+  file = here("figures", "nvenn_official_sexual_offences.png"),
+  width = 2400,
+  height = 1800
+)
+```
+
+
+```{r}
+set.seed(123)
+
+fit <- nVennDiagram(
+  sets,
+  verbose = FALSE
+)
+
+fit <- setVennSkin(
+  fit,
+  params = list(
+    opacity = 0.55,
+    lineWidth = 1.6,
+    fontSize = 12,
+    fontFamily = "roboto_slab",
+    showRegions = FALSE,
+    showWeights = TRUE,
+    colors = palette
+  ),
+  plot = FALSE
+)
+
+# ------------------------------------------------------------
+# PNG export
+# ------------------------------------------------------------
+
+png(
+  here("figures", "nvenn_vawg_definitions_1.png"),
+  width = 2400,
+  height = 1300,
+  res = 300,
+  bg = "white",
+  type = "cairo"
+)
+
+par(family = "roboto_slab", mar = c(1, 1, 1, 8))
+fit <- setVennSkin(
+  fit,
+  params = list(
+    opacity = 0.55,
+    lineWidth = 2,
+    fontSize = 12,
+    showRegions = FALSE,
+    showWeights = TRUE,
+    colors = palette
+  ),
+  plot = FALSE
+)
+
+# Display in RStudio
+plotVenn(fit)
+
+# Install/load rsvg if needed
+if (!requireNamespace("rsvg", quietly = TRUE)) {
+  install.packages("rsvg")
+}
+
+# Export SVG
+svg_file <- here("figures", "nvenn_vawg_definition_1.svg")
+
+plotVenn(
+  fit,
+  outFile = svg_file
+)
+
+# Convert SVG to high-resolution PNG
+rsvg::rsvg_png(
+  svg_file,
+  file = here("figures", "nvenn_vawg_definition_1.png"),
+  width = 2400,
+  height = 1800
+)
+```

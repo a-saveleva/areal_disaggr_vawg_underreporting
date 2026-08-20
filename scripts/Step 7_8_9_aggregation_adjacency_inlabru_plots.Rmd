@@ -1,0 +1,2083 @@
+---
+title: "Areal disaggregation of reporting probabilities"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+---
+This notebook fits person-level binomial areal-disaggregation models with `inlabru`. The target parameter is probability of reporting a VAWG offence. For VAWG definition and data pre=processing steps refer to the main dissertation text.
+
+# 1. Packages and project paths
+```{r}
+#install.packages(c("survey", "here"))
+```
+
+```{r setup, message=FALSE, warning=FALSE}
+library(INLA)
+library(inlabru)
+library(sf)
+library(spdep)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(tibble)
+library(readr)
+library(ggplot2)
+library(patchwork)
+library(scales)
+library(showtext)
+library(sysfonts)
+library(survey)
+library(here)
+
+font_add_google("Roboto Slab", "roboto_slab")
+showtext_auto(TRUE)
+map_family <- "roboto_slab"
+
+set.seed(20260805) #default seed for predictions
+options(scipen = 999, dplyr.summarise.inform = FALSE) #preference to decimal notation
+
+project_dir <- here()
+survey_file <- file.path(project_dir, "data/csew/exp_for_inla_stage/export_for_inla_2.csv") #this is the person-level CSEW file
+district_file <- file.path(project_dir,"data/geographies/ltla/export_small_geogr_ew_with_covariates_1.gpkg") # LTLA geometry, covariates and age × employment population counts
+graph_file <- file.path(project_dir, "data/geographies/ltla/district_graph.gra")
+output_dir <- file.path(project_dir, "figures")
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+compute_options <- bru_options(
+  verbose = FALSE,
+  control.predictor = list(compute = TRUE),
+  control.compute = list(waic = TRUE, dic = TRUE, cpo = TRUE, config = TRUE
+  ))
+```
+
+# 2. Import survey, spatial data and Census MRP cells
+
+The survey file contains one row per respondent. The LTLA geopackage contains geometry, area-level predictors and the eight Census-derived age × employment poststratification counts. Age and employment are the only MRP dimensions; the remaining individual characteristics stay in the fitted latent field and are not poststratified.
+
+```{r import-data}
+snake_case_value <- function(x) { x <- trimws(as.character(x)); x[x==""] <- NA_character_; x <- tolower(x); x <- gsub("&","and",x); x <- gsub("[^a-z0-9]+","_",x); x <- gsub("^_+|_+$","",x); gsub("_+","_",x) }
+
+harmonise_shared_categories <- function(data) data |> mutate(
+  agelong=snake_case_value(agelong),gor=snake_case_value(gor),
+  remploya=case_when(snake_case_value(remploya)=="employed"~"employed",snake_case_value(remploya)%in%c("not_employed","unemployed","economically_inactive","unemployed_or_economically_inactive")~"unemployed_or_economically_inactive",TRUE~snake_case_value(remploya)),
+  nslivarr=case_when(snake_case_value(nslivarr)%in%c("live_as_couple","lives_as_couple","living_as_couple")~"live_as_couple",snake_case_value(nslivarr)%in%c("not_live_as_couple","does_not_live_as_couple","not_living_as_couple")~"not_live_as_couple",TRUE~snake_case_value(nslivarr)),
+  educint=case_when(snake_case_value(educint)%in%c("no_qualification","no_qualifications")~"no_qualifications",snake_case_value(educint)%in%c("has_qualification","has_qualifications","qualified")~"has_qualifications",TRUE~snake_case_value(educint)),
+  relig3=case_when(snake_case_value(relig3)=="no_religion"~"no_religion",snake_case_value(relig3)%in%c("christian","christian_religion")~"christian_religion",snake_case_value(relig3)%in%c("non_christian","non_christian_religion")~"non_christian_religion",TRUE~snake_case_value(relig3)),
+  illharmONS2=case_when(snake_case_value(illharmONS2)=="disabled"~"disabled",snake_case_value(illharmONS2)%in%c("not_disabled","non_disabled")~"not_disabled",TRUE~snake_case_value(illharmONS2))
+)
+
+df <- read_csv(survey_file,show_col_types=FALSE)
+districts <- st_read(district_file,quiet=TRUE) |> arrange(LAD23CD)
+
+population_cols <- c("age_16_24_Employed","age_25_34_Employed","age_35_64_Employed","age_65_plus_Employed","age_16_24_Unemployed_or_economically_inactive","age_25_34_Unemployed_or_economically_inactive","age_35_64_Unemployed_or_economically_inactive","age_65_plus_Unemployed_or_economically_inactive")
+stopifnot(all(population_cols %in% names(districts)),!anyDuplicated(districts$LAD23CD))
+
+mrp_population <- districts |> st_drop_geometry() |> select(LAD23CD,LAD23NM,gor,all_of(population_cols)) |>
+  pivot_longer(all_of(population_cols),names_to=c("agelong","remploya"),names_pattern="^(age_(?:16_24|25_34|35_64|65_plus))_(.+)$",values_to="N") |>
+  mutate(LAD23CD=as.character(LAD23CD),gor=snake_case_value(gor),agelong=snake_case_value(agelong),remploya=snake_case_value(remploya),N=as.numeric(N)) |>
+  filter(is.finite(N),N>0)
+```
+
+# 3. Population cells and MRP weights
+
+Both fitting and poststratification use the same LTLA × age × employment Census cells. `fit_weight` distributes a respondent across candidate LTLAs within their GOR and age × employment stratum; `mrp_weight` combines the eight poststratification cells within each LTLA.
+
+```{r population-weights}
+district_weights <- mrp_population |>
+  mutate(mrp_strata=interaction(agelong,remploya,sep="_",drop=TRUE)) |>
+  group_by(LAD23CD,gor,agelong,remploya,mrp_strata) |> summarise(N=sum(N),.groups="drop") |>
+  group_by(LAD23CD) |> mutate(mrp_weight=N/sum(N)) |> ungroup()
+
+fit_weights <- district_weights |> group_by(LAD23CD,gor,mrp_strata) |> summarise(N=sum(N),.groups="drop") |>
+  group_by(gor,mrp_strata) |> mutate(fit_weight=N/sum(N)) |> ungroup()
+
+stopifnot(all(is.finite(fit_weights$fit_weight)),all(is.finite(district_weights$mrp_weight)),
+  max(abs(fit_weights |> group_by(gor,mrp_strata) |> summarise(x=sum(fit_weight),.groups="drop") |> pull(x)-1))<1e-10,
+  max(abs(district_weights |> group_by(LAD23CD) |> summarise(x=sum(mrp_weight),.groups="drop") |> pull(x)-1))<1e-10)
+```
+# 4. LAD adjacency graph
+
+This reproduces the queen-contiguity graph and the three accepted manual links.
+The graph order is used to create a stable integer `spatial_id`.
+
+The initial `poly2nb()` call may warn about islands or disconnected subgraphs before
+the accepted manual links are added. The checks below are applied to the final graph.
+
+```{r adjacency-graph}
+nb <- poly2nb(st_geometry(districts),row.names=districts$LAD23CD,queen=TRUE,snap=350)
+
+add_nb_link <- function(nb,a,b) {
+  ids <- attr(nb,"region.id"); ia <- match(a,ids); ib <- match(b,ids)
+  stopifnot(!is.na(ia),!is.na(ib),ia!=ib)
+  nb[[ia]] <- as.integer(sort(unique(c(nb[[ia]][nb[[ia]]!=0L],ib))))
+  nb[[ib]] <- as.integer(sort(unique(c(nb[[ib]][nb[[ib]]!=0L],ia))))
+  attr(nb,"sym") <- TRUE
+  nb
+}
+
+nb <- nb |>
+  add_nb_link("E06000046","E07000088") |>
+  add_nb_link("E06000046","E06000045") |>
+  add_nb_link("E06000053","E06000052")
+
+graph_components <- n.comp.nb(nb)
+stopifnot(all(card(nb)>0),graph_components$nc==1L)
+
+dir.create(dirname(graph_file),recursive=TRUE,showWarnings=FALSE)
+nb2INLA(graph_file,nb)
+graph_obj <- inla.read.graph(graph_file)
+graph_levels <- attr(nb,"region.id")
+
+districts <- districts |> mutate(spatial_id=match(LAD23CD,graph_levels))
+fit_weights <- fit_weights |> mutate(spatial_id=match(LAD23CD,graph_levels))
+district_weights <- district_weights |> mutate(spatial_id=match(LAD23CD,graph_levels))
+
+stopifnot(
+  !anyNA(districts$spatial_id),!anyNA(fit_weights$spatial_id),!anyNA(district_weights$spatial_id),
+  identical(as.character(districts$LAD23CD[order(districts$spatial_id)]),as.character(graph_levels)),
+  graph_obj$n==nrow(districts)
+)
+
+check_link <- function(a,b) {
+  ia <- match(a,graph_levels); ib <- match(b,graph_levels)
+  !is.na(ia) && !is.na(ib) && ib %in% nb[[ia]] && ia %in% nb[[ib]]
+}
+stopifnot(
+  check_link("E06000046","E07000088"),
+  check_link("E06000046","E06000045"),
+  check_link("E06000053","E06000052")
+)
+
+component_summary <- tibble(LAD23CD=graph_levels,component=graph_components$comp.id) |> count(component,name="n_LADs")
+component_summary
+
+coords <- st_coordinates(st_centroid(st_geometry(districts)))
+plot(st_geometry(districts),border="grey60",col="white",main="Final district neighbour graph")
+plot(nb,coords,add=TRUE,col="red",lwd=1)
+
+c(districts=nrow(districts),graph_nodes=graph_obj$n,
+  graph_components=graph_components$nc,isolated=sum(card(nb)==0))
+```
+# 5. Person-level survey preparation
+
+No cluster aggregation is performed. Each retained row is one person with a binary
+outcome. The MRP cell combines age and employment. Area characteristics remain
+person-linked contextual covariates, as in the original analysis.
+
+All category values are stored in lower-case snake case, including labels such as
+`employed`, `has_qualifications`, `christian_religion`, `disabled`, and
+`not_live_as_couple`.
+
+```{r prepare-survey}
+factor_vars <- c(
+  "agelong","relig3","rnssec3","livharm1a","nslivarr","ethgrp2a","remploya","remploy2a",
+  "rural3","indlon","inner","imd","imd_crime","polatt7","educint","ladsupgp","nchil2",
+  "managhh2","illharmONS2","oa_sup11","income_group","vawg_official_codes",
+  "vawg_sex_force_threats","vawg_domestic","vawg_harasm","reported_discard","gor"
+)
+
+df <- df |>
+  mutate(across(any_of(factor_vars),snake_case_value)) |>
+  harmonise_shared_categories() |>
+  mutate(
+    educint=case_when(educint %in% c("no_qualification","no_qualifications")~"no_qualifications",
+                      !is.na(educint)~"has_qualifications",TRUE~NA_character_),
+    police_known_all=suppressWarnings(as.integer(as.character(police_known_all))),
+    mrp_strata=interaction(agelong,remploya,sep="_",drop=TRUE)
+  ) |>
+  mutate(across(any_of(factor_vars),factor),mrp_strata=factor(mrp_strata))
+
+area_vars <- c("rural3","inner","imd","imd_crime")
+districts <- districts |> mutate(across(any_of(c("gor",area_vars)),snake_case_value))
+
+reference_categories <- list(
+  income_group="middle_incomes",managhh2="unexpected_expenses_problem_to_find",
+  agelong="age_16_24",relig3="no_religion",ethgrp2a="white",
+  imd="middle_deprivation_deciles",imd_crime="middle_deprivation_deciles",
+  educint="no_qualifications",nchil2="no_children_in_household",rnssec3="c1",
+  polatt7="confident_in_police",illharmONS2="not_disabled",
+  remploya="unemployed_or_economically_inactive",nslivarr="not_live_as_couple",
+  inner="not_inner_city",rural3="rural",indlon="london",gor="london",
+  oa_sup11="hard_pressed_living",vawg_official_codes="false",
+  vawg_sex_force_threats="false",vawg_domestic="false",vawg_harasm="false"
+)
+
+set_reference_levels <- function(data,references) {
+  for(v in intersect(names(references),names(data))) {
+    data[[v]] <- droplevels(factor(data[[v]])); ref <- references[[v]]
+    if(ref %in% levels(data[[v]])) data[[v]] <- relevel(data[[v]],ref=ref)
+    else warning("Reference level not found for ",v,": ",ref,
+                 ". Available levels: ",paste(levels(data[[v]]),collapse=", "))
+  }
+  data
+}
+
+df <- set_reference_levels(df,reference_categories)
+
+shared_category_vars <- c("agelong","remploya","gor")
+category_mismatches <- map_dfr(shared_category_vars,\(v)
+  tibble(
+    variable=v,
+    survey_only=paste(setdiff(unique(as.character(df[[v]])),unique(as.character(mrp_population[[v]]))),collapse=", "),
+    population_only=paste(setdiff(unique(as.character(mrp_population[[v]])),unique(as.character(df[[v]]))),collapse=", ")
+  )
+)
+
+category_mismatches
+```
+# 6. Analysis sample and person-to-LAD expansion
+
+All models use one common complete-case sample so WAIC, DIC, CPO, and calibration
+comparisons refer to the same respondents. Every person is expanded to all LADs in
+their GOR and MRP cell. The person-level covariates are repeated across those candidate
+LAD rows; only `spatial_id` and the population weight vary by candidate LAD.
+
+```{r analysis-sample}
+offence_vars <- c("vawg_official_codes","vawg_sex_force_threats","vawg_domestic","vawg_harasm")
+individual_vars <- c("relig3","rnssec3","ethgrp2a","polatt7","educint","nchil2","illharmONS2","nslivarr")
+area_vars <- c("rural3","inner","imd","imd_crime")
+
+required_vars <- c("police_known_all","gor","mrp_strata","ind_weight",offence_vars,individual_vars,area_vars)
+
+person_data <- df |>
+  mutate(ind_weight=as.numeric(ind_weight)) |>
+  filter(complete.cases(pick(all_of(required_vars))),
+         police_known_all %in% c(0L,1L),is.finite(ind_weight),ind_weight>0) |>
+  mutate(obs_id=row_number(),y=police_known_all,n=1L)
+
+survey_keys <- person_data |> distinct(gor,mrp_strata) |> mutate(across(everything(),as.character))
+population_keys <- fit_weights |> distinct(gor,mrp_strata) |> mutate(across(everything(),as.character))
+unmatched_keys <- anti_join(survey_keys,population_keys,by=c("gor","mrp_strata"))
+
+if(nrow(unmatched_keys)) {
+  print(unmatched_keys)
+  stop(nrow(unmatched_keys)," survey gor × mrp_strata combinations have no population weights.")
+}
+
+agg_data <- person_data |>
+  left_join(
+    fit_weights |> select(gor,mrp_strata,LAD23CD,spatial_id,fit_weight),
+    by=c("gor","mrp_strata"),relationship="many-to-many"
+  ) |>
+  mutate(block=obs_id) |>
+  arrange(block,spatial_id)
+
+stopifnot(
+  !anyNA(agg_data$spatial_id),!anyNA(agg_data$fit_weight),
+  n_distinct(agg_data$block)==nrow(person_data),
+  max(abs(agg_data |> group_by(block) |> summarise(x=sum(fit_weight),.groups="drop") |> pull(x)-1))<1e-10
+)
+
+c(
+  people=nrow(person_data),
+  expanded_rows=nrow(agg_data),
+  LADs=n_distinct(agg_data$spatial_id),
+  GORs=n_distinct(person_data$gor)
+)
+```
+
+# 7. Survey-weighted direct GOR estimates
+
+The direct estimates use the respondent weight `ind_weight`. They describe observed
+reporting differences between GORs and provide an observed-scale comparison for the
+model results. They do not validate the inferred LAD estimates.
+
+Because respondents have unequal survey weights, ordinary unweighted Wilson intervals
+are not used. Confidence intervals are calculated using the respondent-weighted survey
+design.
+
+```{r direct-gor-estimates-1}
+# Keep respondents with:
+# 1. a valid binary reporting outcome;
+# 2. a known GOR;
+# 3. a valid positive respondent weight.
+direct_data <- person_data |>
+  mutate(
+    gor = as.character(gor),
+    ind_weight = as.numeric(ind_weight)
+  ) |>
+  filter(
+    y %in% c(0L, 1L),
+    !is.na(gor),
+    is.finite(ind_weight),
+    ind_weight > 0
+  )
+
+
+# Create the survey-design object.
+#
+# ids = ~1 means that only the respondent weights are being used here.
+# No additional clustering or stratification variables are supplied.
+direct_design <- survey::svydesign(
+  ids = ~1,
+  weights = ~ind_weight,
+  data = direct_data
+)
+
+
+# Calculate the weighted reporting proportion separately for each GOR.
+#
+# svyciprop() calculates a weighted proportion.
+# method = "logit" produces confidence limits that stay between 0 and 1.
+direct_gor <- survey::svyby(
+  formula = ~y,
+  by = ~gor,
+  design = direct_design,
+  FUN = survey::svyciprop,
+  method = "logit",
+  vartype = c("se", "ci"),
+  level = 0.95,
+  na.rm = TRUE,
+  keep.names = FALSE
+) |>
+  as_tibble()
+
+
+# The survey package normally returns:
+# y     = weighted estimated proportion;
+# se    = standard error;
+# ci_l  = lower confidence limit;
+# ci_u  = upper confidence limit.
+#
+# Rename these columns to make their meaning clearer.
+direct_gor <- direct_gor |>
+  transmute(
+    gor = as.character(gor),
+    estimate = as.numeric(y),
+    se = as.numeric(`se.as.numeric(y)`),
+    lower = as.numeric(ci_l),
+    upper = as.numeric(ci_u)
+  ) |>
+
+  # Add information about the number of respondents
+  # and the total respondent weight in each GOR.
+  left_join(
+    direct_data |>
+      group_by(gor) |>
+      summarise(
+        unweighted_n = n(),
+        weighted_n = sum(ind_weight),
+        weighted_reported = sum(ind_weight * y),
+        .groups = "drop"
+      ),
+    by = "gor",
+    relationship = "one-to-one"
+  ) |>
+  arrange(estimate)
+
+names(direct_gor)
+# Display the direct weighted estimates.
+direct_gor
+```
+
+
+```{r direct-gor-estimates-2, fig.width=6, fig.height=4, dpi=150, out.width="100%"}
+# Plot the weighted reporting estimate and its 95% confidence interval
+# for each Government Office Region.
+p_direct_gor <- ggplot(
+  direct_gor,
+  aes(
+    x = estimate,
+    y = reorder(gor, estimate)
+  )
+) +
+  geom_errorbarh(
+    aes(
+      xmin = lower,
+      xmax = upper
+    ),
+    height = 0.15
+  ) +
+  geom_point(size = 2) +
+  scale_x_continuous(
+    limits = c(0, 1),
+    labels = label_percent()
+  ) +
+  labs(
+    x = "Survey-weighted reporting estimate with 95% confidence interval",
+    y = NULL,
+    title = "Observed reporting differences between GORs",
+    subtitle = "Person-level estimates weighted by ind_weight"
+  ) +
+  theme_minimal()
+
+p_direct_gor
+
+
+# Save the weighted direct estimates.
+write_csv(
+  direct_gor,
+  file.path(
+    output_dir,
+    "direct_reporting_by_gor_weighted.csv"
+  )
+)
+```
+
+# 8. **PRIORS: primary and sensitivity settings**
+
+**This is the prior-tuning block.** The primary prior follows Wu et al. and the
+R-INLA/inlabru reference specification:
+
+- `P(spatial SD > 1) = 0.01`;
+- `P(phi > 0.5) = 0.5`.
+
+One alternative is fitted for sensitivity analysis. It more strongly regularises the
+total LAD residual variation while leaving the structured/IID mixing prior unchanged:
+
+- `P(spatial SD > 0.5) = 0.05`.
+
+Interpret both SD limits on the log-odds scale and compare the resulting district
+surfaces rather than selecting a prior only because it produces a preferred map.
+
+```{r priors}
+
+# ============================ PRIOR BLOCK ============================
+
+prior_settings <- list(
+
+  # Primary prior used in the main analysis.
+  "Primary: Wu/reference" = list(
+    prec = list(
+      prior = "pc.prec",
+      param = c(1.0, 0.01)
+    ),
+    phi = list(
+      prior = "pc",
+      param = c(0.5, 0.50)
+    )
+  ),
+
+  # Alternative prior used to check whether the LAD estimates
+  # change substantially under stronger spatial regularisation.
+  "Sensitivity: stronger regularisation" = list(
+    prec = list(
+      prior = "pc.prec",
+      param = c(0.25, 0.01)
+    ),
+    phi = list(
+      prior = "pc",
+      param = c(0.5, 0.50)
+    )
+  ),
+  # Sensitivity 2:
+  # same SD prior as primary, different prior on the
+  # structured/unstructured variance allocation.
+  "Sensitivity: alternative phi prior" = list(
+    prec = list(
+      prior = "pc.prec",
+      param = c(1.0, 0.01)
+    ),
+    phi = list(
+      prior = "pc",
+      param = c(0.25, 0.50)
+    )
+  )
+)
+
+# Use the primary prior when fitting the main models.
+primary_prior <- prior_settings[["Primary: Wu/reference"]]
+
+# ====================================================================
+
+
+# Translate example changes on the log-odds scale into probabilities.
+#
+# This helps interpret what shifts such as -1, -0.5, 0.5 and 1 mean
+# when the starting reporting probability is 10%, 20% or 40%.
+prior_interpretation <- crossing(
+  baseline = c(0.10, 0.20, 0.40),
+  shift = c(-1, -0.5, 0.5, 1)
+) |>
+  mutate(
+    probability = plogis(
+      qlogis(baseline) + shift
+    )
+  )
+
+prior_interpretation
+```
+
+# 9. Model definitions
+
+The six original substantive model sets are retained. The component formula,
+observation formula, and prediction expression are all generated from the same term
+list to prevent accidental inconsistencies.
+
+```{r model-definitions}
+model_terms <- list(
+  "Model 1" = c("rural3", "imd_crime"),
+  "Model 2" = c(
+    "rural3", "imd_crime", "relig3", "rnssec3", "ethgrp2a",
+    "polatt7", "educint", "nchil2", "illharmONS2", "nslivarr"
+  ),
+  "Model 3" = c("rural3", "inner", "imd", "imd_crime"),
+  "Model 4" = c("rural3", "imd_crime", offence_vars),
+  "Model 5" = c(area_vars, individual_vars, offence_vars),
+  "Model 6" = c(area_vars, individual_vars)
+)
+
+component_call <- function(v) sprintf('%s(%s, model = "factor_contrast")', v, v)
+
+make_components <- function(terms, spatial_prior) {
+  rhs <- c(
+    "-1", "Intercept(1)",
+    vapply(terms, component_call, character(1)),
+    paste0(
+      "district_effect(spatial_id, model = \"bym2\", graph = graph_file, ",
+      "scale.model = TRUE, constr = TRUE, hyper = spatial_prior)"
+    ),
+    'strata_effect(mrp_strata, model = "factor_contrast")'
+  )
+  as.formula(paste("~", paste(rhs, collapse = " + ")))
+}
+
+make_obs_formula <- function(terms) {
+  as.formula(paste(
+    "y ~",
+    paste(c("Intercept", terms, "district_effect", "strata_effect"), collapse = " + ")
+  ))
+}
+
+make_prediction_formula <- function(terms) {
+  as.formula(paste(
+    "~ plogis(",
+    paste(c("Intercept", terms, "district_effect", "strata_effect"), collapse = " + "),
+    ")"
+  ))
+}
+```
+
+# 10. Fit person-level binomial disaggregation models
+
+Each observed person contributes one Bernoulli/binomial outcome. `agg_data` contains
+multiple candidate LAD rows for that person. `bm_logitaverage()` computes the
+population-weighted average probability over candidate LADs before the binomial
+likelihood is evaluated.
+
+```{r fit-models}
+fit_disaggregation_model <- function(terms, spatial_prior = primary_prior) {
+  components <- make_components(terms, spatial_prior)
+  likelihood <- bru_obs(
+    family = "binomial",
+    formula = make_obs_formula(terms),
+    data = agg_data,
+    response_data = person_data,
+    Ntrials = n,
+    aggregate = bm_logitaverage(n_block = nrow(person_data)),
+    aggregate_input = list(
+      block = agg_data$block,
+      weights = agg_data$fit_weight,
+      n_block = nrow(person_data)
+    )
+  )
+  bru(components, likelihood, options = compute_options)
+}
+
+fits <- imap(model_terms, function(terms, model_name) {
+  message("Fitting ", model_name)
+  fit_disaggregation_model(terms)
+})
+
+list2env(setNames(fits, paste0("fit_", seq_along(fits))), envir = .GlobalEnv)
+fits[["Model 1"]]
+```
+
+# 11. Fitted probabilities, residuals, and calibration
+
+For Bernoulli outcomes, Pearson residuals use `p(1-p)`. Calibration bins compare the
+mean fitted probability with the observed event proportion.
+
+```{r diagnostics, fig.width=20, fig.height=4.5, dpi=150, out.width="100%"}
+showtext::showtext_auto(TRUE)
+map_family <- "roboto_slab"
+
+extract_diagnostics <- function(fit,model_name,n.samples=1000L) {
+  terms <- model_terms[[model_name]]
+
+  candidate_predictions <- predict(
+    fit,newdata=agg_data,formula=make_prediction_formula(terms),
+    n.samples=n.samples,seed=123,drop=TRUE
+  )
+
+  if(is.data.frame(candidate_predictions)) {
+    if(!"mean" %in% names(candidate_predictions))
+      stop(model_name,": prediction output has no 'mean' column. Columns are: ",paste(names(candidate_predictions),collapse=", "))
+    candidate_fitted <- candidate_predictions$mean
+  } else if(is.numeric(candidate_predictions)) {
+    candidate_fitted <- candidate_predictions
+  } else {
+    stop(model_name,": unexpected prediction output class: ",paste(class(candidate_predictions),collapse=", "))
+  }
+
+  stopifnot(length(candidate_fitted)==nrow(agg_data),all(is.finite(candidate_fitted)))
+
+  fitted_by_person <- tibble(
+    block=agg_data$block,fit_weight=agg_data$fit_weight,candidate_fitted=candidate_fitted
+  ) |>
+    group_by(block) |>
+    summarise(fitted=sum(candidate_fitted*fit_weight),.groups="drop") |>
+    arrange(block)
+
+  stopifnot(nrow(fitted_by_person)==nrow(person_data),fitted_by_person$block==person_data$obs_id)
+
+  fitted_values <- fitted_by_person$fitted
+
+  residuals <- person_data |>
+    transmute(
+      obs_id,gor,y,model=model_name,fitted=fitted_values,
+      raw_residual=y-fitted_values,
+      pearson_residual=(y-fitted_values)/sqrt(pmax(fitted_values*(1-fitted_values),1e-8))
+    )
+
+  calibration <- residuals |>
+    mutate(bin=ntile(fitted,10)) |>
+    group_by(model,bin) |>
+    summarise(
+      mean_fitted=mean(fitted,na.rm=TRUE),
+      mean_observed=mean(y,na.rm=TRUE),
+      observations=n(),.groups="drop"
+    ) |>
+    arrange(model,mean_fitted) |>
+    mutate(
+      calibration_gap=mean_observed-mean_fitted,
+      absolute_gap=abs(calibration_gap),
+      ribbon_lower=pmin(mean_fitted,mean_observed),
+      ribbon_upper=pmax(mean_fitted,mean_observed)
+    )
+
+  brier_score <- mean((residuals$y-residuals$fitted)^2,na.rm=TRUE)
+  fitted_safe <- pmin(pmax(residuals$fitted,1e-6),1-1e-6)
+  logit_fitted <- qlogis(fitted_safe)
+
+  calibration_intercept <- unname(coef(glm(residuals$y~1,offset=logit_fitted,family=binomial()))[1])
+  calibration_slope <- unname(coef(glm(residuals$y~logit_fitted,family=binomial()))[["logit_fitted"]])
+
+  calibration_summary <- calibration |>
+    summarise(
+      mean_calibration_error=weighted.mean(calibration_gap,w=observations,na.rm=TRUE),
+      ece=weighted.mean(absolute_gap,w=observations,na.rm=TRUE),
+      maximum_calibration_error=max(absolute_gap,na.rm=TRUE),
+      rms_calibration_error=sqrt(weighted.mean(calibration_gap^2,w=observations,na.rm=TRUE))
+    ) |>
+    mutate(
+      brier_score=brier_score,
+      calibration_intercept=calibration_intercept,
+      calibration_slope=calibration_slope,
+      model=model_name
+    ) |>
+    select(model,everything())
+
+  list(residuals=residuals,calibration=calibration,summary=calibration_summary)
+}
+
+diagnostics <- imap(fits,extract_diagnostics)
+residuals_all <- map_dfr(diagnostics,"residuals")
+calibration_all <- map_dfr(diagnostics,"calibration")
+diagnostic_summary <- map_dfr(diagnostics,"summary")
+diagnostic_summary
+
+diagnostic_summary_display <- diagnostic_summary |>
+  mutate(
+    mean_calibration_error_pp=100*mean_calibration_error,
+    ece_pp=100*ece,
+    maximum_calibration_error_pp=100*maximum_calibration_error,
+    rms_calibration_error_pp=100*rms_calibration_error
+  ) |>
+  select(model,brier_score,calibration_intercept,calibration_slope,
+         mean_calibration_error_pp,ece_pp,maximum_calibration_error_pp,rms_calibration_error_pp)
+
+diagnostic_summary_display
+
+diag_theme <- theme_minimal(base_family=map_family,base_size=9) +
+  theme(
+    text=element_text(family=map_family),
+    plot.title=element_text(family=map_family,size=11,face="bold"),
+    plot.subtitle=element_text(family=map_family,size=8.5),
+    axis.title=element_text(family=map_family,size=8.5),
+    axis.text=element_text(family=map_family,size=7.5),
+    strip.text=element_text(family=map_family,size=8,face="bold"),
+    legend.text=element_text(family=map_family,size=7.5),
+    legend.title=element_text(family=map_family,size=8),
+    legend.position="bottom",
+    panel.grid.minor=element_blank(),
+    panel.grid.major=element_line(linewidth=.2),
+    plot.margin=margin(4,5,3,4)
+  )
+```
+
+
+```{r diagnostics, fig.width=8, fig.height=4, dpi=300, out.width="100%"}
+p_residuals <- ggplot(residuals_all, aes(fitted, raw_residual)) +
+  geom_point(alpha=.18,size=.45) +
+  geom_hline(yintercept=0,linewidth=.35) +
+  geom_smooth(se=FALSE,linewidth=.55) +
+  facet_wrap(~model,nrow=1) +
+  scale_x_continuous(labels=label_percent()) +
+  labs(x="Posterior mean fitted reporting probability",
+       y="Raw residual (observed - fitted)") +
+  diag_theme +
+  theme(aspect.ratio=1.03,legend.position="none")
+
+p_calibration <- ggplot(calibration_all, aes(mean_fitted, mean_observed)) +
+  geom_ribbon(aes(ymin=ribbon_lower,ymax=ribbon_upper,group=model),alpha=.18) +
+  geom_abline(intercept=0,slope=1,linetype="dashed",colour="grey45",linewidth=.25) +
+  geom_line(aes(group=model),linewidth=.8) +
+  geom_point(size=2) +
+  facet_wrap(~model,nrow=1) +
+  coord_equal() +
+  scale_x_continuous(labels=label_percent()) +
+  scale_y_continuous(labels=label_percent()) +
+  labs(x="Mean fitted reporting probability",
+       y="Observed reporting proportion") +
+  diag_theme +
+  theme(legend.position="none")
+
+diagnostic_plots <- p_residuals / p_calibration
+diagnostic_plots
+ggsave(here("figures", "diagnostic_plots.png"),plot=diagnostic_plots, width=8, height=4, dpi=300, bg="white")
+
+write_csv(diagnostic_summary,file.path(output_dir,"model_diagnostic_summary.csv"))
+write_csv(diagnostic_summary_display,file.path(output_dir,"model_diagnostic_summary_percentage_points.csv"))
+```
+# 12. Model comparison
+```{r}
+fmt <- \(m,l,u) c(coef=sprintf("%.3f",m), cri=sprintf("%.3f to %.3f",l,u))
+
+model_parameters <- imap_dfr(fits,\(fit,m){
+  f <- as.data.frame(fit$summary.fixed) |> rownames_to_column("p")
+  h <- as.data.frame(fit$summary.hyperpar) |> rownames_to_column("p")
+  i <- f |> filter(grepl("Intercept",p)) |> slice(1)
+  pr <- h |> filter(grepl("precision.*district",p,ignore.case=TRUE)) |> slice(1)
+  ph <- h |> filter(grepl("phi.*district",p,ignore.case=TRUE)) |> slice(1)
+
+  bind_rows(
+    tibble(Parameter="Intercept (log-odds scale)", !!!as.list(fmt(i$mean,i$`0.025quant`,i$`0.975quant`))),
+    tibble(Parameter="Intercept (probability, %)",
+           coef=sprintf("%.1f%%",100*plogis(i$mean)),
+           cri=sprintf("%.1f%%–%.1f%%",100*plogis(i$`0.025quant`),100*plogis(i$`0.975quant`))),
+    tibble(Parameter="Spatial precision", !!!as.list(fmt(pr$mean,pr$`0.025quant`,pr$`0.975quant`))),
+    tibble(Parameter="Spatial SD", !!!as.list(fmt(1/sqrt(pr$mean),1/sqrt(pr$`0.975quant`),1/sqrt(pr$`0.025quant`)))),
+    tibble(Parameter="Spatial phi", !!!as.list(fmt(ph$mean,ph$`0.025quant`,ph$`0.975quant`)))
+  ) |> mutate(Model=m)
+}) |>
+  pivot_wider(
+    names_from=Model,
+    values_from=c(coef,cri),
+    names_glue="{Model} {.value}",
+    names_vary="slowest"
+  )
+
+model_parameters
+write_csv(model_parameters,file.path(output_dir, "model_parameters_final.csv"))
+```
+
+WAIC, DIC, and CPO describe fit at the observed person/GOR scale. They do not by
+themselves validate the inferred LAD pattern.
+
+```{r model-comparison}
+model_comparison_table <- imap_dfr(fits,
+  function(fit, model_name) {
+    tibble(
+      Model = model_name,
+      WAIC = if (!is.null(fit$waic$waic)) fit$waic$waic else NA_real_, # WAIC and DIC were already calculated during model fitting because control.compute requested them.
+      DIC  = if (!is.null(fit$dic$dic)) fit$dic$dic else NA_real_
+    )
+  }) |>
+  mutate(
+    delta_WAIC = WAIC - min(WAIC, na.rm = TRUE),
+    delta_DIC  = DIC - min(DIC, na.rm = TRUE)
+  ) |>
+  arrange(WAIC)
+model_comparison_table
+write_csv(model_comparison_table,file.path(output_dir, "model_comparison_WAIC_DIC_final.csv"))
+```
+
+# 13. Parameter and covariate summaries
+
+Age and employment are fitted jointly through `strata_effect(mrp_strata)` and are the only poststratified characteristics. Religion, qualification, disability, living arrangement and the remaining individual, area and offence variables remain fitted model components but are not poststratified. The LAD-specific BYM2 spatial effect is not included in the covariate table.
+
+```{r parameter-tables}
+extract_hyperparameters <- function(fit,model_name) as.data.frame(fit$summary.hyperpar) |> rownames_to_column("parameter") |> transmute(model=model_name,parameter,mean,sd,lower=`0.025quant`,median=`0.5quant`,upper=`0.975quant`)
+
+mrp_covariate_vars <- character(0)
+non_mrp_individual_vars <- individual_vars
+covariate_order <- c("mrp_strata",non_mrp_individual_vars,area_vars,offence_vars)
+
+extract_covariates <- function(fit,model_name) {
+  components <- fit$summary.random; keep <- intersect(c("strata_effect",non_mrp_individual_vars,area_vars,offence_vars),names(components))
+  map_dfr(keep,\(component) { x <- as.data.frame(components[[component]]); level_col <- if("ID" %in% names(x)) "ID" else names(x)[1]; tibble(model=model_name,covariate=if(component=="strata_effect") "mrp_strata" else component,level=as.character(x[[level_col]]),estimate=as.numeric(x$mean),lower=as.numeric(x$`0.025quant`),upper=as.numeric(x$`0.975quant`)) })
+}
+
+hyperparameter_table <- imap_dfr(fits,extract_hyperparameters)
+covariate_long <- imap_dfr(fits,extract_covariates) |> mutate(
+  group=case_when(covariate=="mrp_strata"~"MRP age × employment strata",covariate%in%non_mrp_individual_vars~"Individual characteristics",covariate%in%area_vars~"Area characteristics",covariate%in%offence_vars~"Offence characteristics",TRUE~"Other"),
+  group=factor(group,levels=c("MRP age × employment strata","Individual characteristics","Area characteristics","Offence characteristics","Other")),
+  covariate=factor(covariate,levels=covariate_order),coefficient=sprintf("%.3f",estimate),`95% CrI`=sprintf("%.3f to %.3f",lower,upper))
+
+covariate_table_final <- covariate_long |> select(group,covariate,level,model,coefficient,`95% CrI`) |> distinct() |>
+  pivot_wider(names_from=model,values_from=c(coefficient,`95% CrI`),names_glue="{model} {.value}",names_vary="slowest") |>
+  arrange(group,covariate,level) |> mutate(covariate=as.character(covariate)) |> rename(`Variable group`=group,Variable=covariate,Category=level)
+
+covariate_table_final
+mrp_covariate_table <- covariate_table_final |> filter(`Variable group`=="MRP age × employment strata")
+non_mrp_covariate_table <- covariate_table_final |> filter(`Variable group`%in%c("Individual characteristics","Area characteristics","Offence characteristics"))
+# mrp_covariate_table; non_mrp_covariate_table
+
+# write_csv(hyperparameter_table,file.path(output_dir,"model_hyperparameters.csv"))
+# write_csv(covariate_long,file.path(output_dir,"model_covariate_coefficients_long.csv"))
+write_csv(covariate_table_final,file.path(output_dir,"covariate_and_mrp_coefficients_by_model_final.csv"))
+# write_csv(mrp_covariate_table,file.path(output_dir,"MRP_covariate_coefficients_by_model.csv"))
+# write_csv(non_mrp_covariate_table,file.path(output_dir,"non_MRP_covariate_coefficients_by_model.csv"))
+```
+# 14. LAD-by-MRP prediction grid
+
+Only age and employment are poststratified. Other predictors remain in the fitted model and are fixed at their declared reference categories for LTLA prediction.
+
+```{r prediction-grid}
+area_prediction_data <- districts |> st_drop_geometry() |> select(LAD23CD,spatial_id) |> distinct(LAD23CD,.keep_all=TRUE)
+poststratified_vars <- c("agelong","remploya")
+
+prediction_data <- district_weights |> select(LAD23CD,gor,spatial_id,mrp_strata,agelong,remploya,N,mrp_weight) |>
+  left_join(area_prediction_data,by=c("LAD23CD","spatial_id"),relationship="many-to-one")
+
+non_poststratified_vars <- setdiff(unique(c(area_vars,individual_vars,offence_vars)),poststratified_vars)
+for(v in non_poststratified_vars) { if(is.null(reference_categories[[v]])) stop("No reference category declared for: ",v); prediction_data[[v]] <- reference_categories[[v]] }
+for(v in intersect(names(prediction_data),names(agg_data))) if(is.factor(agg_data[[v]])) prediction_data[[v]] <- factor(prediction_data[[v]],levels=levels(agg_data[[v]]))
+
+required_prediction_vars <- unique(c("LAD23CD","gor","spatial_id","mrp_strata","N","mrp_weight",unlist(model_terms)))
+missing_prediction_vars <- setdiff(required_prediction_vars,names(prediction_data)); if(length(missing_prediction_vars)) stop("Prediction data is missing: ",paste(missing_prediction_vars,collapse=", "))
+factor_prediction_vars <- intersect(required_prediction_vars,names(agg_data)); missing_factor_values <- factor_prediction_vars[vapply(prediction_data[factor_prediction_vars],anyNA,logical(1))]
+if(length(missing_factor_values)) stop("Prediction variables contain missing values after matching factor levels: ",paste(missing_factor_values,collapse=", "))
+stopifnot(!anyNA(prediction_data$spatial_id),!anyNA(prediction_data$mrp_weight),max(abs(prediction_data |> group_by(LAD23CD) |> summarise(x=sum(mrp_weight),.groups="drop") |> pull(x)-1))<1e-10)
+prediction_data
+```
+
+# 15. Posterior samples and sample-wise MRP
+`generate()` returns posterior draws of each LAD-by-cell probability. LAD-overall MRP estimates are calculated within every posterior draw and only then summarised, which preserves dependence between cells and model components.
+
+```{r posterior-prediction}
+n_prediction_samples <- 2000L
+
+summarise_draws <- function(draws) {
+  tibble(
+    mean = rowMeans(draws),
+    sd = apply(draws, 1, sd),
+    lower = apply(draws, 1, quantile, probs = 0.025),
+    median = apply(draws, 1, median),
+    upper = apply(draws, 1, quantile, probs = 0.975)
+  )
+}
+
+predict_model <- function(fit, terms, model_name, data = prediction_data,
+                          n.samples = n_prediction_samples) {
+  draws <- generate(
+    fit, newdata = data,
+    formula = make_prediction_formula(terms),
+    n.samples = n.samples,
+    seed = 123
+  )
+  draws <- as.matrix(draws)
+  stopifnot(nrow(draws) == nrow(data))
+
+  cell <- bind_cols(
+    data |> select(LAD23CD,gor,mrp_strata,agelong,remploya,N,mrp_weight),
+    summarise_draws(draws)
+  ) |>
+    mutate(ci_width = upper - lower, model = model_name)
+
+  district_index <- split(seq_len(nrow(data)), data$LAD23CD)
+  district_draws <- do.call(rbind, lapply(district_index, function(idx) {
+    colSums(draws[idx, , drop = FALSE] * data$mrp_weight[idx])
+  }))
+
+  district <- bind_cols(
+    tibble(LAD23CD = names(district_index)),
+    summarise_draws(district_draws)
+  ) |>
+    left_join(districts |> st_drop_geometry() |> select(LAD23CD, gor),
+              by = "LAD23CD") |>
+    mutate(ci_width = upper - lower, model = model_name)
+
+  list(
+  cell = cell,
+  district = district,
+  cell_draws = draws,
+  district_draws = district_draws
+)
+}
+
+predictions <- imap(fits, function(fit, model_name) {
+  message("Predicting ", model_name)
+  predict_model(fit, model_terms[[model_name]], model_name)
+})
+
+cell_predictions <- map_dfr(predictions, "cell")
+district_predictions <- map_dfr(predictions, "district")
+
+# write_csv(cell_predictions,
+#           file.path(output_dir, "LAD_by_MRP_cell_predictions.csv"))
+# write_csv(district_predictions,
+#           file.path(output_dir, "LAD_overall_MRP_predictions.csv"))
+```
+
+# 16. Aggregation consistency and GOR comparison
+`cell_predictions` contains the Census-derived LTLA × age × employment poststratification cells. Overall LTLA estimates use `mrp_weight`; respondent-to-LTLA fitting uses `fit_weight` within GOR × age × employment strata.
+
+```{r aggregation-check}
+# Reconstruct model estimates at the observed GOR scale.
+# This uses the same respondents and respondent weights as direct_gor,
+# making the comparison internally consistent.
+reconstructed_gor <- residuals_all |>
+  left_join(
+    person_data |>
+      select(obs_id, ind_weight),
+    by = "obs_id",
+    relationship = "many-to-one"
+  ) |>
+  group_by(model, gor) |>
+  summarise(
+    reconstructed = weighted.mean(
+      fitted,
+      w = ind_weight,
+      na.rm = TRUE
+    ),
+    .groups = "drop"
+  ) |>
+  left_join(
+    direct_gor |>
+      select(
+        gor,
+        direct = estimate,
+        lower,
+        upper
+      ),
+    by = "gor",
+    relationship = "many-to-one"
+  )
+```
+
+
+```{r}
+reconstructed_gor |>
+  filter(
+    is.na(direct) |
+    is.na(reconstructed) |
+    direct < 0 | direct > 1 |
+    reconstructed < 0 | reconstructed > 1
+  ) |>
+  select(model, gor, direct, reconstructed)
+```
+```{r}
+df |>
+  count(gor, sort = TRUE)
+
+person_data |>
+  count(gor, sort = TRUE)
+
+fit_weights |>
+  count(gor, sort = TRUE)
+```
+
+
+```{r aggregation-check-2, fig.width=10, fig.height=3, dpi=300, out.width="100%"}
+# Both direct and reconstructed values should be probabilities between zero and one.
+stopifnot(
+  all(reconstructed_gor$direct >= 0 & reconstructed_gor$direct <= 1),
+  all(reconstructed_gor$reconstructed >= 0 &
+        reconstructed_gor$reconstructed <= 1)
+)
+
+direct_reconstructed_gor <- ggplot(
+  reconstructed_gor,
+  aes(direct, reconstructed, colour = model, group = model)
+) +
+  geom_abline(intercept = 0, slope = 1, linetype = 2) +
+  geom_line(linewidth = 0.6, alpha = 0.7) +
+  geom_point() +
+  scale_x_continuous(
+    limits = c(0.47, 0.66),
+    labels = label_percent()
+  ) +
+  scale_y_continuous(
+    limits = c(0.47, 0.66),
+    labels = label_percent()
+  ) +
+  labs(
+    x = "Direct GOR reporting estimate",
+    y = "Reconstructed model estimate",
+    title = "Direct and reconstructed reporting estimates by GOR"
+  ) +
+  theme_minimal(
+    base_family = "roboto_slab"
+  ) +
+  theme(
+    legend.title = element_blank()
+  )
+direct_reconstructed_gor
+ggsave(here("figures", "direct_reconstructed_gor.png"),plot = direct_reconstructed_gor, width = 10,height = 3,dpi = 300,bg = "white")
+```
+
+# 17. Prior sensitivity for the primary substantive model
+One model is refitted under the stronger-regularisation prior. Posterior LAD estimates are compared with the primary-prior fit. Large LAD changes alongside similar GOR fits indicate that fine-scale conclusions depend materially on the spatial prior.
+
+```{r prior-sensitivity, fig.width=8.27, fig.height=8.83, dpi=300, out.width="100%"}
+showtext::showtext_auto(TRUE)
+map_family <- "roboto_slab"
+
+# -------------------- PRIOR SENSITIVITY: REFIT + PLOTS --------------------
+sensitivity_model <- "Model 5"
+sensitivity_terms <- model_terms[[sensitivity_model]]
+
+message("Refitting ", sensitivity_model, " with stronger spatial regularisation...")
+fit_sensitivity_prec <- fit_disaggregation_model(
+  terms = sensitivity_terms,
+  spatial_prior = prior_settings[["Sensitivity: stronger regularisation"]]
+)
+
+message("Refitting ", sensitivity_model, " with alternative phi prior...")
+fit_sensitivity_phi <- fit_disaggregation_model(
+  terms = sensitivity_terms,
+  spatial_prior = prior_settings[["Sensitivity: alternative phi prior"]]
+)
+
+build_prior_comparison <- function(primary_fit,alt_fit,alt_name,out_file) {
+  out <- bind_rows(
+    predict_model(primary_fit,sensitivity_terms,"Primary: Wu/reference")$district |> mutate(prior="Primary: Wu/reference"),
+    predict_model(alt_fit,sensitivity_terms,alt_name)$district |> mutate(prior=alt_name)
+  ) |>
+    select(LAD23CD,prior,mean,sd,lower,median,upper,ci_width) |>
+    pivot_wider(names_from=prior,values_from=c(mean,sd,lower,median,upper,ci_width),names_glue="{.value}__{prior}") |>
+    mutate(
+      mean_change=.data[[paste0("mean__",alt_name)]]-.data[["mean__Primary: Wu/reference"]],
+      absolute_change=abs(mean_change),
+      relative_to_primary_sd=absolute_change/pmax(.data[["sd__Primary: Wu/reference"]],1e-8)
+    ) |>
+    left_join(
+      districts |> st_drop_geometry() |> select(LAD23CD,LAD23NM,gor) |> distinct(),
+      by="LAD23CD",relationship="many-to-one"
+    ) |>
+    mutate(gor=as.character(gor),LAD_label=paste0(LAD23CD,": ",LAD23NM)) |>
+    arrange(desc(absolute_change))
+
+  write_csv(out,file.path(output_dir,out_file))
+  out
+}
+prior_comparison_phi <- build_prior_comparison(
+  primary_fit = fits[[sensitivity_model]],
+  alt_fit = fit_sensitivity_phi,
+  alt_name = "Sensitivity: alternative phi prior",
+  out_file = "prior_sensitivity_alternative_phi_LAD_comparison.csv"
+)
+
+pretty_gor <- function(x) recode(as.character(x),
+  "north_east"="North East","north_west"="North West","yorkshire_and_the_humber"="Yorkshire and the Humber",
+  "east_midlands"="East Midlands","west_midlands"="West Midlands","east_of_england"="East of England",
+  "london"="London","south_east"="South East","south_west"="South West","wales"="Wales",
+  .default=stringr::str_to_title(stringr::str_replace_all(as.character(x),"_"," ")))
+
+prior_comparison_prec <- prior_comparison_prec |> mutate(gor=pretty_gor(gor))
+prior_comparison_phi <- prior_comparison_phi |> mutate(gor=pretty_gor(gor))
+
+gor_levels <- c("North East","North West","Yorkshire and the Humber","East Midlands","West Midlands","East of England","London","South East","South West","Wales")
+gor_cols <- setNames(c("#0072B2","#D55E00","#009E73","#CC79A7","#E69F00","#56B4E9","#000000","#F0E442","#8C564B","#6A3D9A"),gor_levels)
+
+scatter_vals <- c(
+  prior_comparison_prec$`mean__Primary: Wu/reference`,
+  prior_comparison_prec$`mean__Sensitivity: stronger regularisation`,
+  prior_comparison_phi$`mean__Primary: Wu/reference`,
+  prior_comparison_phi$`mean__Sensitivity: alternative phi prior`
+)
+```
+
+
+```{r prior-sensitivity-0, fig.width=8.27, fig.height=8.83, dpi=300, out.width="100%"}
+scatter_lim <- range(scatter_vals,is.finite(scatter_vals),na.rm=TRUE)
+scatter_pad <- diff(scatter_lim)*.025
+scatter_lim <- c(.49,.57)
+
+prior_theme <- theme_minimal(base_family=map_family) +
+  theme(text=element_text(family=map_family),
+        plot.title=element_text(size=10.5,face="bold",hjust=0,margin=margin(b=4)),
+        axis.title=element_text(size=8.5),axis.title.y=element_text(margin=margin(r=2)),
+        axis.text=element_text(size=7.5),
+        legend.title=element_blank(),legend.text=element_text(size=7),
+        legend.key.width=unit(3,"mm"),legend.key.height=unit(3,"mm"),
+        legend.spacing.x=unit(1,"mm"),legend.spacing.y=unit(0,"mm"),
+        legend.margin=margin(0,0,0,0),legend.box.margin=margin(0,0,0,0),
+        panel.grid.minor=element_blank(),panel.grid.major=element_line(linewidth=.2),
+        plot.margin=margin(4,4,4,2))
+
+make_prior_plots <- function(dat,alt_name,scatter_title,change_title,change_xlab) {
+  dat <- dat |> mutate(gor=factor(gor,levels=gor_levels))
+
+  p_scatter <- ggplot(dat,aes(x=.data[["mean__Primary: Wu/reference"]],y=.data[[paste0("mean__",alt_name)]],colour=gor)) +
+    geom_abline(intercept=0,slope=1,linetype=2,linewidth=.3,colour="grey45") +
+    geom_point(alpha=.85,size=.75) +
+    scale_colour_manual(values=gor_cols,drop=FALSE) +
+    scale_x_continuous(labels=label_percent(),limits=scatter_lim) +
+    scale_y_continuous(labels=label_percent(),limits=scatter_lim) +
+    coord_equal() +
+    labs(x="Primary-prior LAD mean",y="Sensitivity-prior LAD mean",
+         title=stringr::str_wrap(scatter_title,30),colour=NULL) +
+    guides(colour=guide_legend(nrow=2,byrow=TRUE,override.aes=list(size=2,alpha=1))) +
+    prior_theme
+
+  p_change <- dat |>
+    slice_max(absolute_change,n=30,with_ties=FALSE) |>
+    mutate(LAD_label=reorder(LAD_label,mean_change)) |>
+    ggplot(aes(mean_change,LAD_label)) +
+    geom_col(fill="#6a2c91") +
+    geom_vline(xintercept=0,linetype=2,linewidth=.3) +
+    scale_x_continuous(labels=label_percent()) +
+    labs(x=change_xlab,y=NULL,title=stringr::str_wrap(change_title,38)) +
+    prior_theme + theme(axis.text.y=element_text(size=6.5))
+
+  list(scatter=p_scatter,change=p_change)
+}
+
+prec_plots <- make_prior_plots(prior_comparison_prec,"Sensitivity: stronger regularisation",
+  "Sensitivity to stronger spatial regularisation",
+  "Thirty LTLAs with the largest change under stronger regularisation",
+  "Sensitivity mean minus primary mean")
+
+phi_plots <- make_prior_plots(prior_comparison_phi,"Sensitivity: alternative phi prior",
+  "Sensitivity to the BYM2 mixing prior",
+  "Thirty LTLAs with the largest change under alternative phi",
+  "Sensitivity mean minus primary mean")
+
+prior_sensitivity_summaries <- bind_rows(
+  prior_comparison_prec |> summarise(
+    sensitivity="Stronger regularisation",median_absolute_change=median(absolute_change,na.rm=TRUE),
+    p90_absolute_change=quantile(absolute_change,.9,na.rm=TRUE),maximum_absolute_change=max(absolute_change,na.rm=TRUE),
+    rank_correlation=cor(`mean__Primary: Wu/reference`,`mean__Sensitivity: stronger regularisation`,method="spearman",use="complete.obs"),
+    proportion_change_gt_2pp=mean(absolute_change>.02,na.rm=TRUE),
+    proportion_change_gt_primary_sd=mean(relative_to_primary_sd>1,na.rm=TRUE)),
+  prior_comparison_phi |> summarise(
+    sensitivity="Alternative phi prior",median_absolute_change=median(absolute_change,na.rm=TRUE),
+    p90_absolute_change=quantile(absolute_change,.9,na.rm=TRUE),maximum_absolute_change=max(absolute_change,na.rm=TRUE),
+    rank_correlation=cor(`mean__Primary: Wu/reference`,`mean__Sensitivity: alternative phi prior`,method="spearman",use="complete.obs"),
+    proportion_change_gt_2pp=mean(absolute_change>.02,na.rm=TRUE),
+    proportion_change_gt_primary_sd=mean(relative_to_primary_sd>1,na.rm=TRUE))
+)
+
+scatter_row <- (prec_plots$scatter | phi_plots$scatter) + plot_layout(guides="collect")
+change_row <- prec_plots$change | phi_plots$change
+
+final_prior_plots <- (scatter_row/change_row) +
+  plot_annotation(
+    title=paste0("Prior sensitivity for ",sensitivity_model),
+    subtitle="Top row: primary-prior versus sensitivity-prior LAD means; bottom row: thirty largest LTLA changes",
+    theme=theme(text=element_text(family=map_family),
+                plot.title=element_text(family=map_family,size=11.5,face="bold",hjust=0),
+                plot.subtitle=element_text(family=map_family,size=8.5,hjust=0))
+  ) &
+  theme(legend.position="bottom",legend.box="horizontal",
+        legend.box.spacing=unit(0,"mm"))
+
+print(final_prior_plots)
+prior_sensitivity_summaries
+```
+
+
+
+```{r prior-sensitivity-1, fig.width=8.27, fig.height=8.83, dpi=300, out.width="100%"}
+# -------------------- PRIOR SENSITIVITY: REFIT + PLOTS --------------------
+sensitivity_model <- "Model 6"
+sensitivity_terms <- model_terms[[sensitivity_model]]
+
+message("Refitting ", sensitivity_model, " with stronger spatial regularisation...")
+fit_sensitivity_prec <- fit_disaggregation_model(
+  terms = sensitivity_terms,
+  spatial_prior = prior_settings[["Sensitivity: stronger regularisation"]]
+)
+
+message("Refitting ", sensitivity_model, " with alternative phi prior...")
+fit_sensitivity_phi <- fit_disaggregation_model(
+  terms = sensitivity_terms,
+  spatial_prior = prior_settings[["Sensitivity: alternative phi prior"]]
+)
+
+build_prior_comparison <- function(primary_fit,alt_fit,alt_name,out_file) {
+  out <- bind_rows(
+    predict_model(primary_fit,sensitivity_terms,"Primary: Wu/reference")$district |> mutate(prior="Primary: Wu/reference"),
+    predict_model(alt_fit,sensitivity_terms,alt_name)$district |> mutate(prior=alt_name)
+  ) |>
+    select(LAD23CD,prior,mean,sd,lower,median,upper,ci_width) |>
+    pivot_wider(names_from=prior,values_from=c(mean,sd,lower,median,upper,ci_width),names_glue="{.value}__{prior}") |>
+    mutate(
+      mean_change=.data[[paste0("mean__",alt_name)]]-.data[["mean__Primary: Wu/reference"]],
+      absolute_change=abs(mean_change),
+      relative_to_primary_sd=absolute_change/pmax(.data[["sd__Primary: Wu/reference"]],1e-8)
+    ) |>
+    left_join(
+      districts |> st_drop_geometry() |> select(LAD23CD,LAD23NM,gor) |> distinct(),
+      by="LAD23CD",relationship="many-to-one"
+    ) |>
+    mutate(gor=as.character(gor),LAD_label=paste0(LAD23CD,": ",LAD23NM)) |>
+    arrange(desc(absolute_change))
+
+  write_csv(out,file.path(output_dir,out_file))
+  out
+}
+
+prior_comparison_phi <- build_prior_comparison(
+  primary_fit = fits[[sensitivity_model]],
+  alt_fit = fit_sensitivity_phi,
+  alt_name = "Sensitivity: alternative phi prior",
+  out_file = "prior_sensitivity_alternative_phi_LAD_comparison.csv"
+)
+
+pretty_gor <- function(x) recode(as.character(x),
+  "north_east"="North East","north_west"="North West","yorkshire_and_the_humber"="Yorkshire and the Humber",
+  "east_midlands"="East Midlands","west_midlands"="West Midlands","east_of_england"="East of England",
+  "london"="London","south_east"="South East","south_west"="South West","wales"="Wales",
+  .default=stringr::str_to_title(stringr::str_replace_all(as.character(x),"_"," ")))
+
+prior_comparison_prec <- prior_comparison_prec |> mutate(gor=pretty_gor(gor))
+prior_comparison_phi <- prior_comparison_phi |> mutate(gor=pretty_gor(gor))
+
+gor_levels <- c("North East","North West","Yorkshire and the Humber","East Midlands","West Midlands","East of England","London","South East","South West","Wales")
+gor_cols <- setNames(c("#0072B2","#D55E00","#009E73","#CC79A7","#E69F00","#56B4E9","#000000","#F0E442","#8C564B","#6A3D9A"),gor_levels)
+
+scatter_vals <- c(
+  prior_comparison_prec$`mean__Primary: Wu/reference`,
+  prior_comparison_prec$`mean__Sensitivity: stronger regularisation`,
+  prior_comparison_phi$`mean__Primary: Wu/reference`,
+  prior_comparison_phi$`mean__Sensitivity: alternative phi prior`
+)
+```
+
+
+```{r prior-sensitivity-11, fig.width=8.27, fig.height=8.83, dpi=300, out.width="100%"}
+scatter_lim <- range(scatter_vals,is.finite(scatter_vals),na.rm=TRUE)
+scatter_pad <- diff(scatter_lim)*.025
+scatter_lim <- c(.57,.65)
+
+prior_theme <- theme_minimal(base_family=map_family) +
+  theme(text=element_text(family=map_family),
+        plot.title=element_text(size=10.5,face="bold",hjust=0,margin=margin(b=4)),
+        axis.title=element_text(size=8.5),axis.title.y=element_text(margin=margin(r=2)),
+        axis.text=element_text(size=7.5),
+        legend.title=element_blank(),legend.text=element_text(size=7),
+        legend.key.width=unit(3,"mm"),legend.key.height=unit(3,"mm"),
+        legend.spacing.x=unit(1,"mm"),legend.spacing.y=unit(0,"mm"),
+        legend.margin=margin(0,0,0,0),legend.box.margin=margin(0,0,0,0),
+        panel.grid.minor=element_blank(),panel.grid.major=element_line(linewidth=.2),
+        plot.margin=margin(4,4,4,2))
+
+make_prior_plots <- function(dat,alt_name,scatter_title,change_title,change_xlab) {
+  dat <- dat |> mutate(gor=factor(gor,levels=gor_levels))
+
+  p_scatter <- ggplot(dat,aes(x=.data[["mean__Primary: Wu/reference"]],y=.data[[paste0("mean__",alt_name)]],colour=gor)) +
+    geom_abline(intercept=0,slope=1,linetype=2,linewidth=.3,colour="grey45") +
+    geom_point(alpha=.85,size=.75) +
+    scale_colour_manual(values=gor_cols,drop=FALSE) +
+    scale_x_continuous(labels=label_percent(),limits=scatter_lim) +
+    scale_y_continuous(labels=label_percent(),limits=scatter_lim) +
+    coord_equal() +
+    labs(x="Primary-prior LAD mean",y="Sensitivity-prior LAD mean",
+         title=stringr::str_wrap(scatter_title,30),colour=NULL) +
+    guides(colour=guide_legend(nrow=2,byrow=TRUE,override.aes=list(size=2,alpha=1))) +
+    prior_theme
+
+  p_change <- dat |>
+    slice_max(absolute_change,n=30,with_ties=FALSE) |>
+    mutate(LAD_label=reorder(LAD_label,mean_change)) |>
+    ggplot(aes(mean_change,LAD_label)) +
+    geom_col(fill="#6a2c91") +
+    geom_vline(xintercept=0,linetype=2,linewidth=.3) +
+    scale_x_continuous(labels=label_percent()) +
+    labs(x=change_xlab,y=NULL,title=stringr::str_wrap(change_title,38)) +
+    prior_theme + theme(axis.text.y=element_text(size=6.5))
+
+  list(scatter=p_scatter,change=p_change)
+}
+
+prec_plots <- make_prior_plots(prior_comparison_prec,"Sensitivity: stronger regularisation",
+  "Sensitivity to stronger spatial regularisation",
+  "Thirty LTLAs with the largest change under stronger regularisation",
+  "Sensitivity mean minus primary mean")
+
+phi_plots <- make_prior_plots(prior_comparison_phi,"Sensitivity: alternative phi prior",
+  "Sensitivity to the BYM2 mixing prior",
+  "Thirty LTLAs with the largest change under alternative phi",
+  "Sensitivity mean minus primary mean")
+
+prior_sensitivity_summaries <- bind_rows(
+  prior_comparison_prec |> summarise(
+    sensitivity="Stronger regularisation",median_absolute_change=median(absolute_change,na.rm=TRUE),
+    p90_absolute_change=quantile(absolute_change,.9,na.rm=TRUE),maximum_absolute_change=max(absolute_change,na.rm=TRUE),
+    rank_correlation=cor(`mean__Primary: Wu/reference`,`mean__Sensitivity: stronger regularisation`,method="spearman",use="complete.obs"),
+    proportion_change_gt_2pp=mean(absolute_change>.02,na.rm=TRUE),
+    proportion_change_gt_primary_sd=mean(relative_to_primary_sd>1,na.rm=TRUE)),
+  prior_comparison_phi |> summarise(
+    sensitivity="Alternative phi prior",median_absolute_change=median(absolute_change,na.rm=TRUE),
+    p90_absolute_change=quantile(absolute_change,.9,na.rm=TRUE),maximum_absolute_change=max(absolute_change,na.rm=TRUE),
+    rank_correlation=cor(`mean__Primary: Wu/reference`,`mean__Sensitivity: alternative phi prior`,method="spearman",use="complete.obs"),
+    proportion_change_gt_2pp=mean(absolute_change>.02,na.rm=TRUE),
+    proportion_change_gt_primary_sd=mean(relative_to_primary_sd>1,na.rm=TRUE))
+)
+
+scatter_row <- (prec_plots$scatter | phi_plots$scatter) + plot_layout(guides="collect")
+change_row <- prec_plots$change | phi_plots$change
+
+final_prior_plots <- (scatter_row/change_row) +
+  plot_annotation(
+    title=paste0("Prior sensitivity for ",sensitivity_model),
+    subtitle="Top row: primary-prior versus sensitivity-prior LAD means; bottom row: thirty largest LTLA changes",
+    theme=theme(text=element_text(family=map_family),
+                plot.title=element_text(family=map_family,size=11.5,face="bold",hjust=0),
+                plot.subtitle=element_text(family=map_family,size=8.5,hjust=0))
+  ) &
+  theme(legend.position="bottom",legend.box="horizontal",
+        legend.box.spacing=unit(0,"mm"))
+
+print(final_prior_plots)
+prior_sensitivity_summaries
+```
+
+```{r prior-sensitivity-2, fig.width=8.27, fig.height=8.83, dpi=300, out.width="100%"}
+# -------------------- PRIOR SENSITIVITY: REFIT + PLOTS --------------------
+sensitivity_model <- "Model 4"
+sensitivity_terms <- model_terms[[sensitivity_model]]
+
+message("Refitting ", sensitivity_model, " with stronger spatial regularisation...")
+fit_sensitivity_prec <- fit_disaggregation_model(
+  terms = sensitivity_terms,
+  spatial_prior = prior_settings[["Sensitivity: stronger regularisation"]]
+)
+
+message("Refitting ", sensitivity_model, " with alternative phi prior...")
+fit_sensitivity_phi <- fit_disaggregation_model(
+  terms = sensitivity_terms,
+  spatial_prior = prior_settings[["Sensitivity: alternative phi prior"]]
+)
+
+build_prior_comparison <- function(primary_fit,alt_fit,alt_name,out_file) {
+  out <- bind_rows(
+    predict_model(primary_fit,sensitivity_terms,"Primary: Wu/reference")$district |> mutate(prior="Primary: Wu/reference"),
+    predict_model(alt_fit,sensitivity_terms,alt_name)$district |> mutate(prior=alt_name)
+  ) |>
+    select(LAD23CD,prior,mean,sd,lower,median,upper,ci_width) |>
+    pivot_wider(names_from=prior,values_from=c(mean,sd,lower,median,upper,ci_width),names_glue="{.value}__{prior}") |>
+    mutate(
+      mean_change=.data[[paste0("mean__",alt_name)]]-.data[["mean__Primary: Wu/reference"]],
+      absolute_change=abs(mean_change),
+      relative_to_primary_sd=absolute_change/pmax(.data[["sd__Primary: Wu/reference"]],1e-8)
+    ) |>
+    left_join(
+      districts |> st_drop_geometry() |> select(LAD23CD,LAD23NM,gor) |> distinct(),
+      by="LAD23CD",relationship="many-to-one"
+    ) |>
+    mutate(gor=as.character(gor),LAD_label=paste0(LAD23CD,": ",LAD23NM)) |>
+    arrange(desc(absolute_change))
+
+  write_csv(out,file.path(output_dir,out_file))
+  out
+}
+
+prior_comparison_phi <- build_prior_comparison(
+  primary_fit = fits[[sensitivity_model]],
+  alt_fit = fit_sensitivity_phi,
+  alt_name = "Sensitivity: alternative phi prior",
+  out_file = "prior_sensitivity_alternative_phi_LAD_comparison.csv"
+)
+
+pretty_gor <- function(x) recode(as.character(x),
+  "north_east"="North East","north_west"="North West","yorkshire_and_the_humber"="Yorkshire and the Humber",
+  "east_midlands"="East Midlands","west_midlands"="West Midlands","east_of_england"="East of England",
+  "london"="London","south_east"="South East","south_west"="South West","wales"="Wales",
+  .default=stringr::str_to_title(stringr::str_replace_all(as.character(x),"_"," ")))
+
+prior_comparison_prec <- prior_comparison_prec |> mutate(gor=pretty_gor(gor))
+prior_comparison_phi <- prior_comparison_phi |> mutate(gor=pretty_gor(gor))
+
+gor_levels <- c("North East","North West","Yorkshire and the Humber","East Midlands","West Midlands","East of England","London","South East","South West","Wales")
+gor_cols <- setNames(c("#0072B2","#D55E00","#009E73","#CC79A7","#E69F00","#56B4E9","#000000","#F0E442","#8C564B","#6A3D9A"),gor_levels)
+
+scatter_vals <- c(
+  prior_comparison_prec$`mean__Primary: Wu/reference`,
+  prior_comparison_prec$`mean__Sensitivity: stronger regularisation`,
+  prior_comparison_phi$`mean__Primary: Wu/reference`,
+  prior_comparison_phi$`mean__Sensitivity: alternative phi prior`
+)
+```
+
+
+```{r prior-sensitivity-22, fig.width=8.27, fig.height=8.83, dpi=300, out.width="100%"}
+scatter_lim <- range(scatter_vals,is.finite(scatter_vals),na.rm=TRUE)
+scatter_pad <- diff(scatter_lim)*.025
+scatter_lim <- c(.43,.53)
+
+prior_theme <- theme_minimal(base_family=map_family) +
+  theme(text=element_text(family=map_family),
+        plot.title=element_text(size=10.5,face="bold",hjust=0,margin=margin(b=4)),
+        axis.title=element_text(size=8.5),axis.title.y=element_text(margin=margin(r=2)),
+        axis.text=element_text(size=7.5),
+        legend.title=element_blank(),legend.text=element_text(size=7),
+        legend.key.width=unit(3,"mm"),legend.key.height=unit(3,"mm"),
+        legend.spacing.x=unit(1,"mm"),legend.spacing.y=unit(0,"mm"),
+        legend.margin=margin(0,0,0,0),legend.box.margin=margin(0,0,0,0),
+        panel.grid.minor=element_blank(),panel.grid.major=element_line(linewidth=.2),
+        plot.margin=margin(4,4,4,2))
+
+make_prior_plots <- function(dat,alt_name,scatter_title,change_title,change_xlab) {
+  dat <- dat |> mutate(gor=factor(gor,levels=gor_levels))
+
+  p_scatter <- ggplot(dat,aes(x=.data[["mean__Primary: Wu/reference"]],y=.data[[paste0("mean__",alt_name)]],colour=gor)) +
+    geom_abline(intercept=0,slope=1,linetype=2,linewidth=.3,colour="grey45") +
+    geom_point(alpha=.85,size=.75) +
+    scale_colour_manual(values=gor_cols,drop=FALSE) +
+    scale_x_continuous(labels=label_percent(),limits=scatter_lim) +
+    scale_y_continuous(labels=label_percent(),limits=scatter_lim) +
+    coord_equal() +
+    labs(x="Primary-prior LAD mean",y="Sensitivity-prior LAD mean",
+         title=stringr::str_wrap(scatter_title,30),colour=NULL) +
+    guides(colour=guide_legend(nrow=2,byrow=TRUE,override.aes=list(size=2,alpha=1))) +
+    prior_theme
+
+  p_change <- dat |>
+    slice_max(absolute_change,n=30,with_ties=FALSE) |>
+    mutate(LAD_label=reorder(LAD_label,mean_change)) |>
+    ggplot(aes(mean_change,LAD_label)) +
+    geom_col(fill="#6a2c91") +
+    geom_vline(xintercept=0,linetype=2,linewidth=.3) +
+    scale_x_continuous(labels=label_percent()) +
+    labs(x=change_xlab,y=NULL,title=stringr::str_wrap(change_title,38)) +
+    prior_theme + theme(axis.text.y=element_text(size=6.5))
+
+  list(scatter=p_scatter,change=p_change)
+}
+
+prec_plots <- make_prior_plots(prior_comparison_prec,"Sensitivity: stronger regularisation",
+  "Sensitivity to stronger spatial regularisation",
+  "Thirty LTLAs with the largest change under stronger regularisation",
+  "Sensitivity mean minus primary mean")
+
+phi_plots <- make_prior_plots(prior_comparison_phi,"Sensitivity: alternative phi prior",
+  "Sensitivity to the BYM2 mixing prior",
+  "Thirty LTLAs with the largest change under alternative phi",
+  "Sensitivity mean minus primary mean")
+
+prior_sensitivity_summaries <- bind_rows(
+  prior_comparison_prec |> summarise(
+    sensitivity="Stronger regularisation",median_absolute_change=median(absolute_change,na.rm=TRUE),
+    p90_absolute_change=quantile(absolute_change,.9,na.rm=TRUE),maximum_absolute_change=max(absolute_change,na.rm=TRUE),
+    rank_correlation=cor(`mean__Primary: Wu/reference`,`mean__Sensitivity: stronger regularisation`,method="spearman",use="complete.obs"),
+    proportion_change_gt_2pp=mean(absolute_change>.02,na.rm=TRUE),
+    proportion_change_gt_primary_sd=mean(relative_to_primary_sd>1,na.rm=TRUE)),
+  prior_comparison_phi |> summarise(
+    sensitivity="Alternative phi prior",median_absolute_change=median(absolute_change,na.rm=TRUE),
+    p90_absolute_change=quantile(absolute_change,.9,na.rm=TRUE),maximum_absolute_change=max(absolute_change,na.rm=TRUE),
+    rank_correlation=cor(`mean__Primary: Wu/reference`,`mean__Sensitivity: alternative phi prior`,method="spearman",use="complete.obs"),
+    proportion_change_gt_2pp=mean(absolute_change>.02,na.rm=TRUE),
+    proportion_change_gt_primary_sd=mean(relative_to_primary_sd>1,na.rm=TRUE))
+)
+
+scatter_row <- (prec_plots$scatter | phi_plots$scatter) + plot_layout(guides="collect")
+change_row <- prec_plots$change | phi_plots$change
+
+final_prior_plots <- (scatter_row/change_row) +
+  plot_annotation(
+    title=paste0("Prior sensitivity for ",sensitivity_model),
+    subtitle="Top row: primary-prior versus sensitivity-prior LAD means; bottom row: thirty largest LTLA changes",
+    theme=theme(text=element_text(family=map_family),
+                plot.title=element_text(family=map_family,size=11.5,face="bold",hjust=0),
+                plot.subtitle=element_text(family=map_family,size=8.5,hjust=0))
+  ) &
+  theme(legend.position="bottom",legend.box="horizontal",
+        legend.box.spacing=unit(0,"mm"))
+
+print(final_prior_plots)
+prior_sensitivity_summaries
+```
+
+# 18. Marginal MRP maps
+
+The prediction grid contains the eight LTLA × age × employment Census cells. The maps below show age and employment separately; for each displayed category, posterior draws are population-averaged over the other MRP dimension before posterior summaries are calculated.
+
+```{r marginal-maps, fig.width=8.27, fig.height=5.83, dpi=300}
+districts_plot <- districts |> select(LAD23CD) |> st_make_valid() |> st_simplify(dTolerance = 100)
+
+mrp_display_vars <- c("agelong","remploya")
+var_labels <- c(agelong="age group",remploya="employment status")
+map_family <- "roboto_slab"
+
+pretty_category <- function(x) {
+  recode(as.character(x),
+    "age_16_24"="16–24","age_25_34"="25–34","age_35_64"="35–64","age_65_plus"="65+",
+    "employed"="Employed","unemployed_or_economically_inactive"="Unemployed or economically inactive",
+    .default=as.character(x)
+  ) |> stringr::str_wrap(width=17)
+}
+
+marginalise_cell_draws <- function(prediction_result, prediction_grid, display_var, model_name) {
+  draws <- prediction_result$cell_draws
+  stopifnot(nrow(draws)==nrow(prediction_grid), display_var %in% names(prediction_grid))
+  key <- interaction(prediction_grid$LAD23CD, prediction_grid[[display_var]], drop=TRUE, lex.order=TRUE)
+  idx <- split(seq_len(nrow(prediction_grid)), key)
+
+  marginal_draws <- do.call(rbind, lapply(idx, function(i) {
+    w <- prediction_grid$N[i] / sum(prediction_grid$N[i])
+    colSums(draws[i,,drop=FALSE] * w)
+  }))
+
+  meta <- bind_rows(lapply(idx, function(i) prediction_grid[i[1], c("LAD23CD",display_var), drop=FALSE]))
+  bind_cols(meta, summarise_draws(marginal_draws)) |>
+    mutate(ci_width=upper-lower, model=model_name, displayed_variable=display_var)
+}
+
+marginal_predictions <- imap_dfr(predictions, \(p,m)
+  map_dfr(mrp_display_vars, \(v) marginalise_cell_draws(p, prediction_data, v, m))) |>
+  mutate(category=coalesce(as.character(agelong),as.character(remploya)))
+
+ci_min <- 0.20
+ci_max <- max(marginal_predictions$ci_width, na.rm=TRUE)
+ci_breaks <- seq(ci_min, ci_max, length.out=11)
+
+base_map_theme <- theme_void(base_family=map_family) +
+  theme(
+    text=element_text(family=map_family,size=11),
+    plot.title=element_text(size=11.5,face="bold",hjust=.5,margin=margin(b=1)),
+    plot.subtitle=element_text(size=9,hjust=.5,lineheight=.95,margin=margin(b=2)),
+    plot.title.position="plot",
+    strip.text=element_text(size=9,face="bold",hjust=.5,lineheight=.9,margin=margin(t=1,b=1)),
+    legend.position="bottom", legend.direction="horizontal",
+    legend.title=element_text(size=9.5,face="bold"),
+    legend.text=element_text(size=8.5),
+    legend.margin=margin(t=-2), legend.box.margin=margin(t=-3),
+    panel.spacing=unit(2,"mm"), plot.margin=margin(2,3,2,3)
+  )
+
+make_marginal_maps <- function(prediction, model_name, display_var) {
+  plot_data <- prediction |>
+    filter(model==model_name, displayed_variable==display_var) |>
+    mutate(category=factor(pretty_category(category), levels=unique(pretty_category(category))))
+
+  map_data <- districts_plot |> left_join(plot_data, by="LAD23CD", relationship="one-to-many")
+  ncol_facets <- if (n_distinct(plot_data$category)<=2) n_distinct(plot_data$category) else 2L
+
+  mean_breaks <- seq(0.40, 0.60, by=0.02)
+  if (length(mean_breaks)<3) mean_breaks <- pretty(range(plot_data$mean,na.rm=TRUE), n=10)
+
+  mean_cols <- c("#543005","#8c510a","#bf812d","#dfc27d","#f6e8c3","#c7eae5","#80cdc1","#35978f","#01665e","#003c30")
+  subtitle_txt <- stringr::str_wrap("Results are population-averaged over the other MRP dimension",width=52)
+
+  mean_map <- ggplot(map_data) +
+    geom_sf(aes(fill=mean), colour="white", linewidth=.02) +
+    facet_wrap(~category, ncol=ncol_facets) +
+    scale_fill_stepsn(
+      colours=mean_cols,breaks=mean_breaks,limits=c(0.40,0.60), labels=label_percent(accuracy=1), name="Predicted reporting", oob=scales::squish,
+      guide=guide_coloursteps(
+        direction="horizontal", title.position="top", title.hjust=.5,
+        barwidth=unit(72,"mm"), barheight=unit(4.5,"mm"),
+        ticks=TRUE, even.steps=TRUE
+      )
+    ) +
+    coord_sf(datum=NA, expand=FALSE) +
+    labs(title=paste0(model_name," – reporting probability by ",var_labels[[display_var]]), subtitle=subtitle_txt) +
+    base_map_theme
+  
+  uncertainty_map <- ggplot(map_data) +
+    geom_sf(aes(fill=ci_width), colour="white", linewidth=.02) +
+    facet_wrap(~category, ncol=ncol_facets) +
+    scale_fill_stepsn(
+      colours = c("#fcfbfd", "#efe7f2", "#d0b8dd", "#b07cc6", "#8c4fb0", "#6a2c91", "#54278f", "#3f007d", "#2b0057", "#14002b"),
+      breaks=ci_breaks,limits=c(ci_min,ci_max),labels=label_percent(accuracy=1),name="95% CrI width", oob=scales::squish,
+      guide=guide_coloursteps(
+        direction="horizontal", title.position="top", title.hjust=.5,
+        barwidth=unit(72,"mm"), barheight=unit(4.5,"mm"),
+        ticks=TRUE, even.steps=TRUE
+      )
+    ) +
+    coord_sf(datum=NA, expand=FALSE) +
+    labs(title=paste0(model_name," – uncertainty by ",var_labels[[display_var]]),
+         subtitle=subtitle_txt) +
+    base_map_theme
+
+  mean_map + uncertainty_map + plot_layout(widths=c(1,1))
+}
+
+# Folder for PNG exports
+png_dir <- file.path(output_dir, "marginal_maps_png")
+dir.create(png_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Build, print, and save all marginal map figures
+marginal_map_plots <- list()
+
+for (m in names(fits)) {
+  vars_to_plot <- mrp_display_vars
+  
+  for (v in vars_to_plot) {
+    p <- make_marginal_maps(marginal_predictions, m, v)
+    
+    file_stub <- paste(m, v, sep = "_") |>
+      stringr::str_replace_all("[^A-Za-z0-9_]+", "_")
+    
+    marginal_map_plots[[file_stub]] <- p
+    print(p)
+    
+    ggsave(
+      filename = file.path(png_dir, paste0(file_stub, ".png")),
+      plot = p,
+      width = 8.27, height = 5.83, units = "in", dpi = 300,
+      bg = "white"
+    )
+  }
+}
+```
+
+
+
+```{r overall-maps, fig.width=8.27, fig.height=5.83, dpi=300}
+mean_min <- min(district_predictions$mean,na.rm=TRUE); mean_max <- max(district_predictions$mean,na.rm=TRUE)
+mean_breaks <- seq(mean_min,mean_max,length.out=11)
+ci_min <- min(district_predictions$ci_width,na.rm=TRUE); ci_max <- max(district_predictions$ci_width,na.rm=TRUE)
+ci_breaks <- seq(ci_min,ci_max,length.out=11)
+
+mean_cols <- c("#543005","#8c510a","#bf812d","#dfc27d","#f6e8c3",
+               "#c7eae5","#80cdc1","#35978f","#01665e","#003c30")
+unc_cols <- c("#fcfbfd","#efe7f2","#d0b8dd","#b07cc6","#8c4fb0",
+              "#6a2c91","#54278f","#3f007d","#2b0057","#14002b")
+
+base_map_theme <- theme_void(base_family=map_family) +
+  theme(
+    text=element_text(family=map_family,size=11),
+    plot.title=element_text(size=11.5,face="bold",hjust=.5,margin=margin(b=1)),
+    plot.subtitle=element_text(size=9,hjust=.5,lineheight=.95,margin=margin(b=2)),
+    plot.title.position="plot",
+    legend.position="bottom", legend.direction="horizontal",
+    legend.title=element_text(size=9.5,face="bold"), legend.text=element_text(size=8.5),
+    legend.margin=margin(t=-2), legend.box.margin=margin(t=-3),
+    plot.margin=margin(2,3,2,3)
+  )
+
+make_overall_maps <- function(prediction,model_name) {
+  map_data <- districts_plot |> left_join(prediction,by="LAD23CD")
+  subtitle_txt <- stringr::str_wrap(
+    "Overall LTLA estimates after poststratification across age × employment cells",
+    width=52
+  )
+
+  mean_map <- ggplot(map_data) +
+    geom_sf(aes(fill=mean),colour="white",linewidth=.03) +
+    scale_fill_stepsn(
+      colours=mean_cols, breaks=mean_breaks, limits=c(mean_min,mean_max),
+      labels=label_percent(accuracy=1), name="Predicted reporting", oob=scales::squish,
+      guide=guide_coloursteps(direction="horizontal",title.position="top",title.hjust=.5,
+                              barwidth=unit(72,"mm"),barheight=unit(4.5,"mm"),
+                              ticks=TRUE,even.steps=TRUE)
+    ) +
+    coord_sf(datum=NA,expand=FALSE) +
+    labs(title=paste0(model_name," – overall LTLA reporting probability"),subtitle=subtitle_txt) +
+    base_map_theme
+
+  uncertainty_map <- ggplot(map_data) +
+    geom_sf(aes(fill=ci_width),colour="white",linewidth=.03) +
+    scale_fill_stepsn(
+      colours=unc_cols, breaks=ci_breaks, limits=c(ci_min,ci_max),
+      labels=label_percent(accuracy=1), name="95% CrI width", oob=scales::squish,
+      guide=guide_coloursteps(direction="horizontal",title.position="top",title.hjust=.5,
+                              barwidth=unit(72,"mm"),barheight=unit(4.5,"mm"),
+                              ticks=TRUE,even.steps=TRUE)
+    ) +
+    coord_sf(datum=NA,expand=FALSE) +
+    labs(title=paste0(model_name," – overall LTLA uncertainty"),subtitle=subtitle_txt) +
+    base_map_theme
+
+  mean_map + uncertainty_map + plot_layout(widths=c(1,1))
+}
+
+for (m in names(fits))
+  print(make_overall_maps(filter(district_predictions,model==m),m))
+```
+```{r getis-ord-maps, fig.width=8.27, fig.height=5.83, dpi=300}
+# Gi* requires the focal LTLA to be included in its own neighbourhood
+nb_star <- include.self(nb)
+listw_star <- nb2listw(nb_star,style="B",zero.policy=TRUE)
+
+gi_cols <- c(
+  "High reporting – high certainty"="#b2182b",
+  "High reporting – low certainty"="#ef8a62",
+  "Low reporting – high certainty"="#2166ac",
+  "Low reporting – low certainty"="#67a9cf",
+  "No significant clustering"="#dddddd"
+)
+
+gi_levels <- names(gi_cols)
+
+getis_ord_results <- map_dfr(names(fits),\(m) {
+  x <- district_predictions |>
+    filter(model==m) |>
+    select(LAD23CD,mean,ci_width) |>
+    right_join(
+      tibble(LAD23CD=graph_levels,spatial_id=seq_along(graph_levels)),
+      by="LAD23CD"
+    ) |>
+    arrange(spatial_id)
+
+  stopifnot(!anyNA(x$mean),nrow(x)==length(nb_star))
+
+  x |>
+    mutate(
+      gi_z=as.numeric(localG(mean,listw_star,zero.policy=TRUE)),
+      certainty_cut=median(ci_width,na.rm=TRUE),
+      certainty=if_else(ci_width<=certainty_cut,"high","low"),
+      gi_class=case_when(
+        gi_z>=1.96 & certainty=="high" ~ "High reporting – high certainty",
+        gi_z>=1.96 & certainty=="low"  ~ "High reporting – low certainty",
+        gi_z<=-1.96 & certainty=="high"~ "Low reporting – high certainty",
+        gi_z<=-1.96 & certainty=="low" ~ "Low reporting – low certainty",
+        TRUE ~ "No significant clustering"
+      ),
+      gi_class=factor(gi_class,levels=gi_levels),
+      model=m
+    )
+})
+
+getis_map_theme <- theme_void(base_family=map_family) +
+  theme(
+    text=element_text(family=map_family),
+    plot.title=element_text(size=12,face="bold",hjust=.5,margin=margin(b=2)),
+    plot.subtitle=element_text(size=9,hjust=.5,lineheight=.95,margin=margin(b=3)),
+    legend.position="bottom",
+    legend.title=element_blank(),
+    legend.text=element_text(size=8),
+    legend.key.height=unit(4,"mm"),
+    legend.key.width=unit(7,"mm"),
+    legend.margin=margin(t=-2),
+    plot.margin=margin(2,3,2,3)
+  )
+
+make_getis_map <- function(m) {
+  map_data <- districts_plot |>
+    left_join(filter(getis_ord_results,model==m),by="LAD23CD")
+
+  ggplot(map_data) +
+    geom_sf(aes(fill=gi_class),colour="white",linewidth=.04) +
+    scale_fill_manual(values=gi_cols,drop=FALSE) +
+    coord_sf(datum=NA,expand=FALSE) +
+    labs(
+      title=paste0(m," – local clusters of overall reporting probability"),
+      subtitle="Getis–Ord Gi*: |z| ≥ 1.96; certainty based on model-specific median 95% CrI width"
+    ) +
+    guides(fill=guide_legend(nrow=2,byrow=TRUE)) +
+    getis_map_theme
+}
+
+for(m in names(fits)) print(make_getis_map(m))
+
+# write_csv(
+#   getis_ord_results |> select(LAD23CD,model,mean,ci_width,gi_z,certainty,gi_class),
+#   file.path(output_dir,"Getis_Ord_overall_reporting_by_model.csv")
+# )
+```
+
+```{r}
+# -----------------------------
+# Global Moran's I by model
+# -----------------------------
+listw <- nb2listw(nb,style="W",zero.policy=TRUE)
+
+moran_results <- map_dfr(names(fits), \(m) {
+  x <- district_predictions |>
+    filter(model==m) |>
+    right_join(tibble(LAD23CD=graph_levels,spatial_id=seq_along(graph_levels)),
+               by="LAD23CD") |>
+    arrange(spatial_id)
+
+  mt <- moran.test(x$mean,listw,zero.policy=TRUE)
+
+  tibble(
+    model=m,
+    morans_i=unname(mt$estimate["Moran I statistic"]),
+    expected_i=unname(mt$estimate["Expectation"]),
+    p_value=mt$p.value
+  )
+})
+
+moran_results
+```
+
+```{r}
+library(showtext)
+showtext_auto()
+map_family <- "roboto_slab"
+```
+
+
+```{r overall-maps-all-models-a5, fig.width=8.27, fig.height=6.7, dpi=300}
+mean_min <- min(district_predictions$mean,na.rm=TRUE); mean_max <- max(district_predictions$mean,na.rm=TRUE)
+ci_min <- min(district_predictions$ci_width,na.rm=TRUE); ci_max <- max(district_predictions$ci_width,na.rm=TRUE)
+mean_breaks <- seq(mean_min,mean_max,length.out=11); ci_breaks <- seq(ci_min,ci_max,length.out=11)
+
+mean_cols <- c("#543005","#8c510a","#bf812d","#dfc27d","#f6e8c3","#c7eae5","#80cdc1","#35978f","#01665e","#003c30")
+unc_cols <- c("#fcfbfd","#efe7f2","#d0b8dd","#b07cc6","#8c4fb0","#6a2c91","#54278f","#3f007d","#2b0057","#14002b")
+
+map_all <- districts_plot |>
+  left_join(district_predictions |> select(LAD23CD,model,mean,ci_width), by="LAD23CD", relationship="one-to-many") |>
+  mutate(model=factor(model,levels=names(fits)), block=if_else(as.integer(model)<=3,"Models 1–3","Models 4–6"))
+
+map_theme <- theme_void(base_family=map_family) +
+  theme(
+    text=element_text(family=map_family), aspect.ratio=1,
+    plot.title=element_text(size=9.5,face="bold",hjust=.5,margin=margin(b=1)),
+    strip.background=element_blank(), strip.text.x=element_text(size=8.5,margin=margin(b=1)),
+    panel.spacing.y=unit(.3,"mm"), plot.margin=margin(.2,.1,.2,.1)
+  )
+
+mean_scale <- scale_fill_stepsn(
+  colours=mean_cols, breaks=mean_breaks, limits=c(mean_min,mean_max), labels=label_percent(accuracy=1),
+  name="Predicted\nreporting", oob=scales::squish,
+  guide=guide_coloursteps(direction="vertical", title.position="top", barwidth=unit(4,"mm"), barheight=unit(34,"mm"),
+                          ticks=TRUE, even.steps=TRUE)
+)
+
+unc_scale <- scale_fill_stepsn(
+  colours=unc_cols, breaks=ci_breaks, limits=c(ci_min,ci_max), labels=label_percent(accuracy=1),
+  name="95% CrI\nwidth", oob=scales::squish,
+  guide=guide_coloursteps(direction="vertical", title.position="top", barwidth=unit(4,"mm"), barheight=unit(34,"mm"),
+                          ticks=TRUE, even.steps=TRUE)
+)
+
+make_col <- function(dat, fill_var, title_txt=NULL, scale_obj) {
+  ggplot(dat) + geom_sf(aes(fill=.data[[fill_var]]), colour="white", linewidth=.015) +
+    facet_wrap(~model, ncol=1, strip.position="top") + scale_obj +
+    coord_sf(datum=NA, expand=FALSE) + labs(title=title_txt) + map_theme
+}
+
+m13b <- make_col(filter(map_all,block=="Models 1–3"), "mean", "Reporting probability", mean_scale)
+m46b <- make_col(filter(map_all,block=="Models 4–6"), "mean", NULL, mean_scale)
+u13b <- make_col(filter(map_all,block=="Models 1–3"), "ci_width", "Uncertainty", unc_scale)
+u46b <- make_col(filter(map_all,block=="Models 4–6"), "ci_width", NULL, unc_scale)
+
+m13 <- m13b + theme(legend.position="none", plot.margin=margin(.2,-20,.2,.1))
+m46 <- m46b + theme(legend.position="none", plot.margin=margin(.2,.1,.2,-20))
+u13 <- u13b + theme(legend.position="none", plot.margin=margin(.2,-2,.2,.1))
+u46 <- u46b + theme(legend.position="none", plot.margin=margin(.2,.1,.2,-2))
+
+mean_key <- wrap_elements(cowplot::get_legend(
+  m13b + theme(legend.position="right",
+               legend.title=element_text(family=map_family,size=8),
+               legend.text=element_text(family=map_family,size=7))
+)) & theme(plot.margin=margin(10,20,10,20))
+
+unc_key <- wrap_elements(cowplot::get_legend(
+  u13b + theme(legend.position="right",
+               legend.title=element_text(family=map_family,size=8),
+               legend.text=element_text(family=map_family,size=7))
+)) & theme(plot.margin=margin(10,20,10,20))
+
+final_overall_maps <- (
+  m13 + m46 + plot_spacer() + mean_key +
+  u13 + u46 + plot_spacer() + unc_key +
+    plot_layout(widths=c(1,1,.10,.24, 1,1,.10,.24)) +
+    plot_annotation(
+      title="Overall LTLA reporting estimates across models",
+      subtitle="Posterior reporting probability (left block) and corresponding 95% credible-interval width (right block)",
+      theme=theme(
+        plot.title=element_text(family=map_family,size=10.5,face="bold",hjust=.5,margin=margin(t=12,b=2)),
+        plot.subtitle=element_text(family=map_family,size=8.5,hjust=.5,margin=margin(b=14))
+      )
+    )
+) & theme(plot.margin=margin(0,0,0,0))
+
+final_overall_maps
+```
+```{r}
+install.packages("shadowtext")
+library(shadowtext)
+```
+
+```{r direct-gor-maps, fig.width=5.27, fig.height=3.83, dpi=300}
+gor_plot <- districts |>
+  st_make_valid() |>
+  mutate(gor = as.character(gor)) |>
+  group_by(gor) |>
+  summarise(.groups = "drop") |>
+  st_make_valid() |>
+  st_simplify(dTolerance = 1000)
+
+direct_gor_map <- direct_gor |>
+  mutate(
+    gor = as.character(gor),
+    ci_width = upper - lower,
+    estimate_lab = scales::percent(estimate, accuracy = 0.1),
+    ci_lab = scales::percent(ci_width, accuracy = 0.1)
+  )
+
+map_data <- gor_plot |>
+  left_join(direct_gor_map, by = "gor")
+
+label_points <- map_data |> st_point_on_surface()
+xy <- st_coordinates(label_points)
+
+label_data <- label_points |>
+  mutate(x = xy[,1], y = xy[,2]) |>
+  st_drop_geometry() |>
+  mutate(
+    x = if_else(gor == "london", x + 30000, x)
+  )
+
+mean_min <- min(map_data$estimate, na.rm = TRUE); mean_max <- max(map_data$estimate, na.rm = TRUE)
+ci_min <- min(map_data$ci_width, na.rm = TRUE); ci_max <- max(map_data$ci_width, na.rm = TRUE)
+mean_breaks <- seq(mean_min, mean_max, length.out = 11)
+ci_breaks <- seq(ci_min, ci_max, length.out = 11)
+
+mean_cols <- c("#543005","#8c510a","#bf812d","#dfc27d","#f6e8c3","#c7eae5","#80cdc1","#35978f","#01665e","#003c30")
+unc_cols  <- c("#fcfbfd","#efe7f2","#d0b8dd","#b07cc6","#8c4fb0","#6a2c91","#54278f","#3f007d","#2b0057","#14002b")
+
+base_map_theme <- theme_void(base_family = map_family) +
+  theme(
+    text = element_text(family = map_family, size = 11),
+    plot.title = element_text(family = map_family, size = 11.5, face = "bold", hjust = .5, margin = margin(b = 1)),
+    plot.subtitle = element_text(family = map_family, size = 9, hjust = .5, lineheight = .95, margin = margin(b = 2)),
+    plot.title.position = "plot",
+    plot.margin = margin(2, 3, 2, 3)
+  )
+
+# subtitle_txt <- stringr::str_wrap(
+#   "Direct survey-weighted reporting estimates by Government Office Region",
+#   width = 52
+# )
+
+p_direct_mean <- ggplot(map_data) +
+  geom_sf(aes(fill = estimate), colour = "white", linewidth = .25) +
+  shadowtext::geom_shadowtext(
+    data = label_data,
+    aes(x = x, y = y, label = estimate_lab),
+    family = map_family, size = 3.2, lineheight = .9,
+    colour = "black", bg.colour = "white", bg.r = 0.15
+  ) +
+  scale_fill_stepsn(
+    colours = mean_cols, breaks = mean_breaks, limits = c(mean_min, mean_max),
+    oob = scales::squish
+  ) +
+  coord_sf(datum = NA, expand = FALSE) +
+  labs(title = "Direct GOR reporting estimate") +
+  base_map_theme +
+  theme(legend.position = "none")
+
+p_direct_unc <- ggplot(map_data) +
+  geom_sf(aes(fill = ci_width), colour = "white", linewidth = .25) +
+  shadowtext::geom_shadowtext(
+    data = label_data,
+    aes(x = x, y = y, label = ci_lab),
+    family = map_family, size = 3.2, lineheight = .9,
+    colour = "black", bg.colour = "white", bg.r = 0.15
+  ) +
+  scale_fill_stepsn(
+    colours = unc_cols, breaks = ci_breaks, limits = c(ci_min, ci_max),
+    oob = scales::squish
+  ) +
+  coord_sf(datum = NA, expand = FALSE) +
+  labs(title = "Direct GOR uncertainty") +
+  base_map_theme +
+  theme(legend.position = "none")
+
+p_direct_mean + p_direct_unc + plot_layout(widths = c(1, 1))
+```
+
+```{r disaggregation-spatial-levels, fig.width=8.27, fig.height=5.83, dpi=300}
+# -----------------------------
+# GOR → LTLA spatial levels
+# -----------------------------
+gor_plot <- districts |> group_by(gor) |> summarise(.groups = "drop")
+bb <- st_bbox(districts)
+
+outline_theme <- theme_void(base_family = map_family) +
+  theme(
+    text = element_text(family = map_family),
+    plot.title = element_text(size = 12, face = "bold", hjust = .5),
+    plot.subtitle = element_text(size = 9, hjust = .5),
+    plot.margin = margin(2, 2, 2, 2)
+  )
+
+fixed_sf <- coord_sf(
+  xlim = c(bb["xmin"], bb["xmax"]),
+  ylim = c(bb["ymin"], bb["ymax"]),
+  datum = NA,
+  expand = FALSE
+)
+
+p_gor <- ggplot() +
+  geom_sf(data = gor_plot, fill = "white", colour = "grey25", linewidth = .25) +
+  fixed_sf +
+  labs(title = "GOR", subtitle = "Observed spatial level") +
+  outline_theme
+
+p_ltla <- ggplot() +
+  geom_sf(data = districts, fill = "white", colour = "grey25", linewidth = .25) +
+  #geom_sf(data = gor_plot, fill = NA, colour = "grey20", linewidth = .35) +
+  fixed_sf +
+  labs(title = "LTLA", subtitle = "Estimated spatial level") +
+  outline_theme
+
+p_gor | p_ltla
+```
+```{r}
+# ------------------------------------------------------------
+# GVIF for all six model specification
+library(car)
+
+offence_vars <- c(
+  "vawg_official_codes","vawg_sex_force_threats",
+  "vawg_domestic","vawg_harasm"
+)
+
+individual_vars <- c(
+  "relig3","rnssec3","ethgrp2a","polatt7",
+  "educint","nchil2","illharmONS2","nslivarr"
+)
+
+area_vars <- c("rural3","inner","imd","imd_crime")
+
+model_terms <- list(
+  "Model 1" = c("rural3","imd_crime"),
+  "Model 2" = c("rural3","imd_crime",individual_vars),
+  "Model 3" = area_vars,
+  "Model 4" = c("rural3","imd_crime",offence_vars),
+  "Model 5" = c(area_vars,individual_vars,offence_vars),
+  "Model 6" = c(area_vars,individual_vars)
+) |>
+  map(~ c("mrp_strata", .x))
+
+get_gvif <- function(vars, model_name) {
+
+  d <- person_data |>
+    select(police_known_all, all_of(vars)) |>
+    mutate(across(all_of(vars), factor))
+
+  fit <- glm(
+    reformulate(vars, response = "police_known_all"),
+    data = d,
+    family = binomial()
+  )
+
+  v <- car::vif(fit)
+
+  as.data.frame(v) |>
+    rownames_to_column("variable") |>
+    mutate(
+      model = model_name,
+      adjusted_GVIF = GVIF^(1 / (2 * Df)),
+      .before = 1
+    ) |>
+    select(model, variable, GVIF, Df, adjusted_GVIF)
+}
+
+gvif_results <- imap_dfr(model_terms, ~ get_gvif(.x, .y))
+
+gvif_results |>
+  arrange(model, desc(adjusted_GVIF))
+```
+
+
+# 19. Reproducibility record
+
+```{r session-info}
+writeLines(capture.output(sessionInfo()), file.path(output_dir, "sessionInfo.txt"))
+sessionInfo()
+```
