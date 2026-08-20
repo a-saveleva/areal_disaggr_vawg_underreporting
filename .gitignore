@@ -7,6 +7,7 @@ data/**/*.csv
 data/**/*.txt
 data/**/*.xlsx
 data/**/*.sps
+data/**/*.zip
 data/geographies/
 ss/
 figures/
