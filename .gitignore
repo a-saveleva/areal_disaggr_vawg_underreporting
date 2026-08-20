@@ -4,6 +4,7 @@ data/**/*.htm
 data/**/*.pdf
 data/**/*.tab
 data/**/*.csv
+data/**/*.txt
 data/**/*.xlsx
 
 # Byte-compiled / optimized / DLL files
