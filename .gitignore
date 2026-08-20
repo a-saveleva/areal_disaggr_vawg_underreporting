@@ -1,3 +1,11 @@
+# Not synching safeguarded csew files and technical reports
+data/**/*.rtf
+data/**/*.htm
+data/**/*.pdf
+data/**/*.tab
+data/**/*.csv
+data/**/*.xlsx
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
