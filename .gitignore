@@ -6,6 +6,9 @@ data/**/*.tab
 data/**/*.csv
 data/**/*.txt
 data/**/*.xlsx
+data/geographies/
+ss/
+figures/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
