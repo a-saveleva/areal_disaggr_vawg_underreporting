@@ -1,5 +1,5 @@
 # Towards Understanding Underreporting of Violence Against Women and Girls in England and Wales
-## Using the Areal Disaggregation Model to Produce Local Underreporting Probability Estimates
+**Using the Areal Disaggregation Model to Produce Local Underreporting Probability Estimates**
 
 This repository contains the code accompanying an MSc dissertation completed at the Centre for Advanced Spatial Analysis (CASA), Bartlett Faculty of the Built Environment, University College London (UCL). The study applies the Areal Disaggregation framework (Wu, Lindgren and Hanson, 2026) to safeguarded Crime Survey for England and Wales (CSEW) data to estimate the probability of reporting Violence Against Women and Girls (VAWG) at the Lower Tier Local Authority (LTLA) level from regional-level geography.
 
@@ -20,7 +20,7 @@ The overall analytical workflow is illustrated below:
 
 ### scripts
 
-Contains all analysis code, organised into sequential steps. These step numbers are also referenced throughout the dissertation. Scripts should be run in alphanumeric order.
+Contains all analysis code, organised into sequential steps. These step numbers are also referenced in the analysis workflow above and throughout the dissertation. Scripts should be run in alphanumeric order.
 
 ## Main Modelling Script
 
@@ -28,12 +28,7 @@ The main modelling stage is contained in:
 
 `Step 7_8_9_aggregation_adjacency_inlabru_plots.Rmd`
 
-This script includes the implementation of the spatial model using **inlabru**, including:
-
-* the `bru()` modelling framework;
-* the aggregation mapper;
-* adjacency and spatial modelling components;
-* generation of model outputs and plots.
+This script includes the implementation of the spatial model using **inlabru**.
 
 ## Data Availability
 
@@ -50,6 +45,10 @@ Wu, Y., Lindgren, F. and Hanson, H.A. (2026) ‘Areal Disaggregation: A Small Ar
 The survey preparation code is based on:
 
 Blom, N. (2023) ‘Code for Merging Waves of the Crime Survey of England and Wales and the British Crime Survey, 1982-2020’. UK Data Service. Available at: https://doi.org/10.5255/UKDA-SN-856494. 
+
+Inlabru package:
+
+Bachl, F.E. et al. (2019) ‘inlabru: an R package for Bayesian spatial modelling from ecological survey data’, Methods in Ecology and Evolution. Edited by R. Freckleton, 10(6), pp. 760–766. Available at: https://doi.org/10.1111/2041-210X.13168. 
 
 Data used:
 
