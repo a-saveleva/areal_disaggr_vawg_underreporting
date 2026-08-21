@@ -5,38 +5,32 @@ This repository contains the code accompanying an MSc dissertation completed at 
 
 ## Repository Structure
 
-### data
+**data**
 
 Contains the folder structure for the datasets used in the analysis. Please note:
 * Safeguarded CSEW data are not included in this repository due to data access and usage conditions. To reuse the code, download the safeguarded CSEW as .tab files for the years of interest
 * Shapefiles and other large spatial datasets are also excluded due to file size.
 
-### figures
+**figures**
 
 Contains the main graphical outputs used in the dissertation.
 The overall analytical workflow is illustrated below:
 
 ![Analysis workflow](figures/steps_diagram.png)
 
-### scripts
+**scripts**
 
 Contains all analysis code, organised into sequential steps. These step numbers are also referenced in the analysis workflow above and throughout the dissertation. Scripts should be run in alphanumeric order.
 
 ## Main Modelling Script
 
-The main modelling stage is contained in:
-
-`Step 7_8_9_aggregation_adjacency_inlabru_plots.Rmd`
-
-This script includes the implementation of the spatial model using **inlabru**.
+The main modelling stage is contained in: `Step 7_8_9_aggregation_adjacency_inlabru_plots.Rmd` This script includes the implementation of the spatial model using **inlabru**.
 
 ## Data Availability
 
 The safeguarded CSEW data required to reproduce parts of the analysis cannot be redistributed through this repository. Users wishing to reproduce the full analysis will need to obtain the relevant data through the appropriate authorised access procedures.
 
 ## Citation
-
-This repository accompanies an MSc dissertation submitted to the Centre for Advanced Spatial Analysis, UCL.
 
 The methodological framework used in the study is based on:
 
