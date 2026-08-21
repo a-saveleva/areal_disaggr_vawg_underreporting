@@ -10,7 +10,6 @@ data/**/*.sps
 data/**/*.zip
 data/geographies/
 ss/
-figures/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
