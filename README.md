@@ -1,35 +1,26 @@
 # Towards Understanding Underreporting of Violence Against Women and Girls in England and Wales
-
 ## Using the Areal Disaggregation Model to Produce Local Underreporting Probability Estimates
 
-This repository contains the code accompanying an MSc dissertation completed at the **Centre for Advanced Spatial Analysis (CASA)**, Bartlett Faculty of the Built Environment, University College London (UCL).
-
-The study applies the **Areal Disaggregation framework** (Wu, Lindgren and Hanson, 2026) to safeguarded **Crime Survey for England and Wales (CSEW)** data to estimate the probability of reporting Violence Against Women and Girls (VAWG) at the **Lower Tier Local Authority (LTLA)** level from regional-level geography.
+This repository contains the code accompanying an MSc dissertation completed at the Centre for Advanced Spatial Analysis (CASA), Bartlett Faculty of the Built Environment, University College London (UCL). The study applies the Areal Disaggregation framework (Wu, Lindgren and Hanson, 2026) to safeguarded Crime Survey for England and Wales (CSEW) data to estimate the probability of reporting Violence Against Women and Girls (VAWG) at the Lower Tier Local Authority (LTLA) level from regional-level geography.
 
 ## Repository Structure
 
-### `data/`
+### data
 
-Contains the folder structure for the datasets used in the analysis.
-
-Please note:
-
-* Safeguarded CSEW data are **not included** in this repository due to data access and usage conditions. To reuse the code, download the safeguarded CSEW as .tab files for the years of interest
+Contains the folder structure for the datasets used in the analysis. Please note:
+* Safeguarded CSEW data are not included in this repository due to data access and usage conditions. To reuse the code, download the safeguarded CSEW as .tab files for the years of interest
 * Shapefiles and other large spatial datasets are also excluded due to file size.
 
-### `figures/`
+### figures
 
 Contains the main graphical outputs used in the dissertation.
-
 The overall analytical workflow is illustrated below:
 
 ![Analysis workflow](figures/steps_diagram.png)
 
-### `scripts/`
+### scripts
 
-Contains all analysis code, organised into sequential steps. These step numbers are also referenced throughout the dissertation.
-
-Scripts should be run in **alphanumeric order**.
+Contains all analysis code, organised into sequential steps. These step numbers are also referenced throughout the dissertation. Scripts should be run in alphanumeric order.
 
 ## Main Modelling Script
 
